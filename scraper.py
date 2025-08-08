@@ -1,624 +1,590 @@
-#!/usr/bin/env python3
+# scraper.py
 """
-MHT-CET College Data Scraper v2.0
+Purpose:
+    Resilient scraper to harvest MHT-CET cutoff information from Shiksha's college predictor pages.
+    Produces `mht_cet_data.json` and (optionally) `mht_cet_data.parquet`.
 
-Purpose: Resilient web scraper for MHT-CET cutoff data from shiksha.com
-Extracts college metadata, branch-wise cutoffs, category-wise ranks, and PDF brochures
-Outputs structured JSON with comprehensive error handling and retry logic
+How to run:
+    1. Create and populate a .env file (see .env.example later in the project).
+    2. Install dependencies: `pip install -r requirements.txt`
+    3. Run: `python scraper.py`
+    4. Output files will be written to ./data/mht_cet_data.json and ./data/mht_cet_data.parquet (if pandas/pyarrow installed).
 
-Usage:
-    python scraper.py
+Environment variables (via .env):
+    - USER_AGENT (optional): user agent string to use for requests. A default is provided.
+    - REQUEST_MIN_DELAY (optional): minimum polite delay between requests in seconds (default 1.5).
+    - REQUEST_MAX_DELAY (optional): maximum polite delay between requests in seconds (default 3.0).
+    - MAX_PAGES (optional): optional limit to pages for testing; default None (crawl until pagination ends).
+    - OUTPUT_DIR (optional): output directory (default ./data).
 
-Environment Variables:
-    SCRAPER_DELAY_MIN=1.5  # Min delay between requests (seconds)
-    SCRAPER_DELAY_MAX=3.0  # Max delay between requests (seconds)
-    SCRAPER_MAX_RETRIES=3  # Max retries for failed requests
-    SCRAPER_TIMEOUT=30     # Request timeout (seconds)
-
-Output:
-    - mht_cet_data.json: Main structured data file
-    - mht_cet_data.parquet: Optional efficient format (if pyarrow available)
-    - scraper.log: Detailed logging output
+Notes / behavior:
+    - Respects polite delays and exponential backoff on 429/5xx responses.
+    - Uses robust parsing heuristics (CSS selectors + text matching + DOM-relative traversal).
+    - If a PDF cutoff brochure is found, downloads and attempts table/text extraction via pdfplumber.
+    - Logs progress, warnings, and parse misses to stdout and `scraper.log`.
+    - Schema per record: {
+          "college": str,
+          "city": Optional[str],
+          "state": Optional[str],
+          "branch": str,
+          "category": str,          # e.g., Open/OBC/SC/ST
+          "closing_rank": Optional[int],
+          "fees": Optional[str],
+          "placement_rating": Optional[float],
+          "naac_rating": Optional[str],
+          "source_url": str,
+          "source_type": "html"|"pdf",
+          "retrieved_at": ISO8601 timestamp
+      }
 """
 
+import os
+import re
+import time
 import json
+import math
 import logging
 import random
-import time
-from typing import Dict, List, Optional, Any, Tuple
-from urllib.parse import urljoin, urlparse
-import os
-from dataclasses import dataclass, asdict
+import pathlib
+from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 
-# Optional PDF processing
+# Optional PDF parsing; handle import errors gracefully
 try:
     import pdfplumber
-    PDF_PROCESSING = True
-except ImportError:
-    PDF_PROCESSING = False
-    logging.warning("pdfplumber not available - PDF extraction disabled")
+except Exception:
+    pdfplumber = None
 
 # Optional parquet output
 try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    PARQUET_AVAILABLE = True
-except ImportError:
-    PARQUET_AVAILABLE = False
+    import pandas as pd  # type: ignore
+    PANDAS_AVAILABLE = True
+except Exception:
+    PANDAS_AVAILABLE = False
 
+# ---- Configuration (overridable by environment) ----
+BASE_URL = "https://www.shiksha.com/engineering/mht-cet-college-predictor"
+USER_AGENT = os.getenv("USER_AGENT",
+                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36 CET-Mentor-Scraper/1.0")
+REQUEST_MIN_DELAY = float(os.getenv("REQUEST_MIN_DELAY", "1.5"))
+REQUEST_MAX_DELAY = float(os.getenv("REQUEST_MAX_DELAY", "3.0"))
+MAX_PAGES = os.getenv("MAX_PAGES")  # optional: for testing
+OUTPUT_DIR = pathlib.Path(os.getenv("OUTPUT_DIR", "./data"))
+LOG_FILE = "scraper.log"
 
-@dataclass
-class CollegeRecord:
-    """Structured college data record"""
-    college: str
-    city: str
-    state: str
-    branch: str
-    category: str  # Open, OBC, SC, ST
-    closing_rank: Optional[int]
-    fees: Optional[str]
-    placement_rating: Optional[float]
-    naac_rating: Optional[str]
-    source_url: str
-    source_type: str  # "html" or "pdf"
-    scraped_at: str
+# Create output dir
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Logging
+logger = logging.getLogger("mht_cet_scraper")
+logger.setLevel(logging.DEBUG)
+fh = logging.FileHandler(LOG_FILE)
+fh.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+logger.addHandler(fh)
+logger.addHandler(ch)
 
-class MHTCETScraper:
-    """Resilient MHT-CET data scraper with retry logic and PDF support"""
-    
-    def __init__(self):
-        self.base_url = "https://www.shiksha.com"
-        self.start_url = "https://www.shiksha.com/engineering/mht-cet-college-predictor"
-        
-        # Configuration from env or defaults
-        self.delay_min = float(os.getenv('SCRAPER_DELAY_MIN', '1.5'))
-        self.delay_max = float(os.getenv('SCRAPER_DELAY_MAX', '3.0'))
-        self.max_retries = int(os.getenv('SCRAPER_MAX_RETRIES', '3'))
-        self.timeout = int(os.getenv('SCRAPER_TIMEOUT', '30'))
-        
-        # Session for connection pooling
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        })
-        
-        # Logging setup
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('scraper.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        
-        self.scraped_urls = set()
-        self.all_records = []
+# Session with default headers
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
 
-    def _polite_delay(self):
-        """Implement polite crawling delay"""
-        delay = random.uniform(self.delay_min, self.delay_max)
-        time.sleep(delay)
+# Rate limiting helpers
+def polite_sleep():
+    delay = random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY)
+    logger.debug(f"Sleeping for {delay:.2f}s to be polite.")
+    time.sleep(delay)
 
-    def _fetch_with_retry(self, url: str, **kwargs) -> Optional[requests.Response]:
-        """Fetch URL with exponential backoff retry logic"""
-        for attempt in range(self.max_retries):
-            try:
-                self._polite_delay()
-                response = self.session.get(url, timeout=self.timeout, **kwargs)
-                
-                if response.status_code == 200:
-                    return response
-                elif response.status_code == 429:
-                    # Rate limited - exponential backoff
-                    wait_time = (2 ** attempt) * random.uniform(1, 3)
-                    self.logger.warning(f"Rate limited on {url}, waiting {wait_time:.1f}s")
-                    time.sleep(wait_time)
-                    continue
-                elif response.status_code >= 500:
-                    # Server error - retry
-                    self.logger.warning(f"Server error {response.status_code} on {url}, attempt {attempt + 1}")
-                    continue
-                else:
-                    self.logger.error(f"HTTP {response.status_code} on {url}")
-                    return None
-                    
-            except requests.exceptions.RequestException as e:
-                self.logger.error(f"Request failed for {url}, attempt {attempt + 1}: {e}")
-                if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    
-        return None
+def exponential_backoff(attempt: int, base: float = 1.0, cap: float = 32.0):
+    sleep = min(cap, base * (2 ** attempt) + random.random())
+    logger.warning(f"Backoff sleep for {sleep:.1f}s (attempt {attempt}).")
+    time.sleep(sleep)
 
-    def _extract_number(self, text: str) -> Optional[int]:
-        """Extract numeric value from text (ranks, fees, etc.)"""
-        if not text:
-            return None
-        
-        # Remove common prefixes/suffixes and convert
-        import re
-        numbers = re.findall(r'\d+', str(text).replace(',', ''))
-        if numbers:
-            try:
-                return int(numbers[0])
-            except ValueError:
-                pass
-        return None
-
-    def _extract_float(self, text: str) -> Optional[float]:
-        """Extract float value from text (ratings, etc.)"""
-        if not text:
-            return None
-        
-        import re
-        matches = re.findall(r'\d+\.?\d*', str(text))
-        if matches:
-            try:
-                return float(matches[0])
-            except ValueError:
-                pass
-        return None
-
-    def _parse_college_page(self, soup: BeautifulSoup, url: str) -> List[CollegeRecord]:
-        """Parse individual college page for detailed cutoff data"""
-        records = []
-        
+# Utility: safe request with retries
+def safe_get(url: str, max_retries: int = 5, timeout: int = 20) -> Optional[requests.Response]:
+    attempt = 0
+    while attempt <= max_retries:
         try:
-            # Primary selectors with fallbacks
-            college_name_selectors = [
-                'h1.college-name',
-                'h1[data-testid="college-name"]',
-                '.college-header h1',
-                'h1',  # Fallback
-            ]
-            
-            city_selectors = [
-                '.college-location .city',
-                '[data-testid="college-city"]',
-                '.location-info .city',
-                '.college-details .city'
-            ]
-            
-            # Extract college basic info
-            college_name = None
-            for selector in college_name_selectors:
-                elem = soup.select_one(selector)
-                if elem:
-                    college_name = elem.get_text().strip()
-                    break
-                    
-            if not college_name:
-                # Fallback: look for text containing common college keywords
-                title_elem = soup.find('title')
-                if title_elem and any(word in title_elem.text.lower() for word in ['college', 'institute', 'university']):
-                    college_name = title_elem.text.split('|')[0].strip()
-                else:
-                    college_name = "Unknown College"
-            
-            # Extract city
-            city = None
-            for selector in city_selectors:
-                elem = soup.select_one(selector)
-                if elem:
-                    city = elem.get_text().strip()
-                    break
-            
-            if not city:
-                # Fallback: look in meta tags or breadcrumbs
-                city = "Unknown City"
-            
-            state = "Maharashtra"  # MHT-CET specific
-            
-            # Extract cutoff table data
-            cutoff_tables = soup.find_all('table') or soup.find_all(class_=lambda x: x and 'cutoff' in x.lower())
-            
-            if not cutoff_tables:
-                # Fallback: look for structured data in divs/cards
-                cutoff_containers = soup.find_all(class_=lambda x: x and any(term in x.lower() for term in ['rank', 'cutoff', 'admission']))
-            
-            # Parse cutoff data
-            parsed_cutoffs = self._parse_cutoff_data(soup)
-            
-            if parsed_cutoffs:
-                for cutoff_data in parsed_cutoffs:
-                    record = CollegeRecord(
-                        college=college_name,
-                        city=city,
-                        state=state,
-                        branch=cutoff_data.get('branch', 'Not Specified'),
-                        category=cutoff_data.get('category', 'Open'),
-                        closing_rank=cutoff_data.get('closing_rank'),
-                        fees=cutoff_data.get('fees'),
-                        placement_rating=cutoff_data.get('placement_rating'),
-                        naac_rating=cutoff_data.get('naac_rating'),
-                        source_url=url,
-                        source_type="html",
-                        scraped_at=datetime.now().isoformat()
-                    )
-                    records.append(record)
-            else:
-                # Create minimal record if no detailed cutoffs found
-                record = CollegeRecord(
-                    college=college_name,
-                    city=city,
-                    state=state,
-                    branch="Not Specified",
-                    category="Open",
-                    closing_rank=None,
-                    fees=None,
-                    placement_rating=None,
-                    naac_rating=None,
-                    source_url=url,
-                    source_type="html",
-                    scraped_at=datetime.now().isoformat()
-                )
-                records.append(record)
-                
-        except Exception as e:
-            self.logger.error(f"Error parsing college page {url}: {e}")
-            
-        return records
-
-    def _parse_cutoff_data(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-        """Extract structured cutoff data from page"""
-        cutoffs = []
-        
-        # Common branch names for pattern matching
-        branches = ['Computer Science', 'Information Technology', 'Electronics', 'Mechanical', 'Civil', 'Electrical']
-        categories = ['Open', 'OBC', 'SC', 'ST']
-        
-        # Try different parsing strategies
-        strategies = [
-            self._parse_table_cutoffs,
-            self._parse_card_cutoffs,
-            self._parse_list_cutoffs
-        ]
-        
-        for strategy in strategies:
-            try:
-                result = strategy(soup)
-                if result:
-                    cutoffs.extend(result)
-                    break
-            except Exception as e:
-                self.logger.debug(f"Strategy failed: {e}")
+            logger.info(f"GET {url} (attempt {attempt + 1})")
+            resp = SESSION.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (429, 500, 502, 503, 504):
+                logger.warning(f"Server returned {resp.status_code} for {url}")
+                exponential_backoff(attempt)
+                attempt += 1
                 continue
-                
-        return cutoffs
+            logger.error(f"Unexpected status {resp.status_code} for {url}")
+            return resp
+        except requests.RequestException as e:
+            logger.exception(f"Request exception for {url}: {e}")
+            exponential_backoff(attempt)
+            attempt += 1
+    logger.error(f"Exceeded max retries for {url}")
+    return None
 
-    def _parse_table_cutoffs(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-        """Parse cutoff data from HTML tables"""
-        cutoffs = []
-        
-        tables = soup.find_all('table')
-        for table in tables:
-            rows = table.find_all('tr')
-            if len(rows) < 2:
-                continue
-                
-            # Try to identify header row
-            header_row = rows[0]
-            headers = [th.get_text().strip().lower() for th in header_row.find_all(['th', 'td'])]
-            
-            # Look for relevant columns
-            branch_col = next((i for i, h in enumerate(headers) if any(term in h for term in ['branch', 'course', 'stream'])), None)
-            category_col = next((i for i, h in enumerate(headers) if any(term in h for term in ['category', 'quota'])), None)
-            rank_col = next((i for i, h in enumerate(headers) if any(term in h for term in ['rank', 'cutoff', 'closing'])), None)
-            
-            if rank_col is not None:
-                for row in rows[1:]:
-                    cells = row.find_all(['td', 'th'])
-                    if len(cells) <= max(branch_col or 0, category_col or 0, rank_col):
-                        continue
-                        
-                    cutoff_data = {
-                        'branch': cells[branch_col].get_text().strip() if branch_col is not None else 'General',
-                        'category': cells[category_col].get_text().strip() if category_col is not None else 'Open',
-                        'closing_rank': self._extract_number(cells[rank_col].get_text().strip()) if rank_col is not None else None
+# ---- Parsing helpers ----
+
+def text_or_none(el) -> Optional[str]:
+    if not el:
+        return None
+    txt = el.get_text(separator=" ", strip=True)
+    return txt if txt else None
+
+def parse_int_maybe(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    # Remove commas, non-digits
+    m = re.search(r"(\d{1,7})", s.replace(",", ""))
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+def parse_float_maybe(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", s.replace(",", ""))
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+def normalize_category(cat: str) -> str:
+    # canonical categories
+    cat = (cat or "").strip().lower()
+    if not cat:
+        return "Open"
+    if "open" in cat:
+        return "Open"
+    if "obc" in cat:
+        return "OBC"
+    if "sc" in cat and "st" not in cat:
+        return "SC"
+    if "st" in cat:
+        return "ST"
+    return cat.title()
+
+# Extract PDF tables/text and try to find (college, branch, category, closing rank)
+def extract_from_pdf_bytes(pdf_bytes: bytes, source_url: str) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    if not pdfplumber:
+        logger.warning("pdfplumber not available; skipping PDF parsing.")
+        return results
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text_all = []
+            for p in pdf.pages:
+                try:
+                    # Try table extraction
+                    tables = p.extract_tables()
+                    if tables:
+                        for table in tables:
+                            # Flatten table rows and attempt to detect common patterns
+                            for row in table:
+                                row_text = " | ".join([cell or "" for cell in row])
+                                text_all.append(row_text)
+                    # Also append raw text for regex parsing
+                    t = p.extract_text()
+                    if t:
+                        text_all.append(t)
+                except Exception as e:
+                    logger.debug(f"pdf page parse error: {e}")
+            combined = "\n".join(text_all)
+            # Heuristic: find lines mentioning branch & category & rank
+            lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+            for ln in lines:
+                # Simple heuristics: "Computer Engineering ... Open 23567"
+                m = re.search(r"(?P<branch>[A-Za-z &/-]{3,60}).{0,20}(?P<cat>Open|OBC|SC|ST|General)?.{0,20}(?P<rank>\d{2,7})", ln, re.I)
+                if m:
+                    rec = {
+                        "college": None,
+                        "city": None,
+                        "state": None,
+                        "branch": m.group("branch").strip(),
+                        "category": normalize_category(m.group("cat") or "Open"),
+                        "closing_rank": parse_int_maybe(m.group("rank")),
+                        "fees": None,
+                        "placement_rating": None,
+                        "naac_rating": None,
+                        "source_url": source_url,
+                        "source_type": "pdf",
+                        "retrieved_at": datetime.utcnow().isoformat() + "Z"
                     }
-                    
-                    if cutoff_data['closing_rank']:
-                        cutoffs.append(cutoff_data)
-                        
-        return cutoffs
+                    results.append(rec)
+            logger.info(f"Extracted {len(results)} candidate rows from PDF {source_url}")
+    except Exception as e:
+        logger.exception(f"PDF parsing failed for {source_url}: {e}")
+    return results
 
-    def _parse_card_cutoffs(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-        """Parse cutoff data from card-based layouts"""
-        cutoffs = []
-        
-        # Look for card containers
-        cards = soup.find_all(class_=lambda x: x and any(term in x.lower() for term in ['card', 'item', 'row']))
-        
-        for card in cards:
-            text_content = card.get_text().lower()
-            if any(term in text_content for term in ['rank', 'cutoff', 'closing']):
-                # Extract data from card
-                branch_elem = card.find(string=lambda x: x and any(b.lower() in x.lower() for b in ['computer', 'mechanical', 'civil', 'electronics']))
-                rank_numbers = [self._extract_number(elem.get_text()) for elem in card.find_all(string=lambda x: x and any(c.isdigit() for c in x))]
-                rank_numbers = [r for r in rank_numbers if r and r > 1000]  # Filter reasonable ranks
-                
-                if rank_numbers:
-                    cutoffs.append({
-                        'branch': branch_elem if branch_elem else 'General',
-                        'category': 'Open',
-                        'closing_rank': min(rank_numbers)
-                    })
-                    
-        return cutoffs
+# ---- HTML parsing for a page ----
 
-    def _parse_list_cutoffs(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
-        """Parse cutoff data from list layouts"""
-        cutoffs = []
-        
-        # Look for list items containing rank information
-        list_items = soup.find_all(['li', 'div'], class_=lambda x: x and 'item' in x.lower())
-        
-        for item in list_items:
-            text = item.get_text()
-            if any(term in text.lower() for term in ['rank', 'cutoff']):
-                rank = self._extract_number(text)
-                if rank and rank > 100:  # Reasonable rank range
-                    cutoffs.append({
-                        'branch': 'General',
-                        'category': 'Open',
-                        'closing_rank': rank
-                    })
-                    
-        return cutoffs
+def find_pagination_next(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    # Try common patterns: rel="next", anchor text Next, aria-label next, or page links
+    next_link = soup.find("link", {"rel": "next"})
+    if next_link and next_link.get("href"):
+        return urljoin(base_url, next_link["href"])
+    # anchor with rel next
+    a = soup.find("a", attrs={"rel": "next"})
+    if a and a.get("href"):
+        return urljoin(base_url, a["href"])
+    # Look for 'Next' text buttons
+    for a in soup.find_all("a", href=True):
+        if a.get_text(strip=True).lower() in ("next", ">", ">>"):
+            return urljoin(base_url, a["href"])
+    # last resort: find pagination and pick next based on 'active' class
+    pag = soup.select_one(".pagination, .pagnation, ul.pagination")
+    if pag:
+        active = pag.select_one(".active")
+        if active:
+            nxt = active.find_next_sibling("li")
+            if nxt and nxt.find("a") and nxt.find("a").get("href"):
+                return urljoin(base_url, nxt.find("a")["href"])
+    return None
 
-    def _extract_pdf_data(self, pdf_url: str) -> List[Dict[str, Any]]:
-        """Extract cutoff data from PDF brochures"""
-        if not PDF_PROCESSING:
-            self.logger.warning(f"PDF processing not available for {pdf_url}")
-            return []
-            
+def parse_college_cards(soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
+    """
+    Parse college/row cards from the predictor list page.
+    This function uses heuristics, because site structure may change.
+    """
+    records: List[Dict[str, Any]] = []
+    # Typical blocks: article cards, results list, table rows
+    candidates = []
+    # Candidate selectors to try
+    selectors = [
+        "div.college-card, div.predictor-card, div.result-card, div.college-list-item",
+        "article, .srp-card, .listing-card",
+        "div[class*='college'], div[class*='card']"
+    ]
+    for sel in selectors:
+        found = soup.select(sel)
+        if found:
+            candidates = found
+            logger.debug(f"Found {len(found)} candidates with selector '{sel}'")
+            break
+    if not candidates:
+        # fallback: search for rows with college names (heuristic)
+        for h in soup.find_all(re.compile("^h[1-6]$")):
+            if h.get_text(strip=True) and len(h.get_text(strip=True)) < 120:
+                parent = h.find_parent()
+                if parent:
+                    candidates.append(parent)
+    logger.info(f"Parsing {len(candidates)} candidate blocks from {page_url}")
+
+    for block in candidates:
         try:
-            response = self._fetch_with_retry(pdf_url)
-            if not response:
-                return []
-                
-            # Save temporarily and process
-            temp_path = f"temp_pdf_{int(time.time())}.pdf"
-            with open(temp_path, 'wb') as f:
-                f.write(response.content)
-                
-            cutoffs = []
-            
-            with pdfplumber.open(temp_path) as pdf:
-                for page in pdf.pages:
-                    # Extract table data
-                    tables = page.extract_tables()
-                    for table in tables or []:
-                        cutoffs.extend(self._parse_pdf_table(table))
-                    
-                    # Extract text patterns
-                    text = page.extract_text()
-                    if text:
-                        cutoffs.extend(self._parse_pdf_text(text))
-                        
-            # Cleanup
-            os.unlink(temp_path)
-            
-            return cutoffs
-            
+            # Attempt multiple strategies to pull data
+            college_name = None
+            # priority: anchor with college name
+            a = block.find("a", href=True, text=True)
+            if a and len(a.get_text(strip=True)) > 3:
+                college_name = a.get_text(strip=True)
+            if not college_name:
+                # headings inside block
+                h = block.find(["h2", "h3", "h4"])
+                if h:
+                    college_name = h.get_text(strip=True)
+            # try meta info
+            city = None
+            state = None
+            # Often location is in a span or small tag
+            loc = block.find(lambda tag: tag.name in ("span", "p", "small") and "location" in (tag.get("class") or []) )
+            if not loc:
+                # text that contains comma separated location like "Mumbai, Maharashtra"
+                text_nodes = block.find_all(text=True)
+                for t in text_nodes:
+                    if "," in t and len(t) < 60 and any(k in t.lower() for k in ("mumbai","pune","nagpur","nashik","thane","aurangabad","maharashtra")):
+                        parts = [p.strip() for p in t.split(",") if p.strip()]
+                        if parts:
+                            city = parts[0]
+                            if len(parts) >= 2:
+                                state = parts[1]
+                                break
+            # Branches/department and cutoff info
+            # Look for small tables or lists inside block
+            branches = []
+            # Try to find table rows in block
+            for table in block.find_all("table"):
+                for tr in table.find_all("tr"):
+                    cells = [td.get_text(separator=" ", strip=True) for td in tr.find_all(["th","td"])]
+                    if not cells:
+                        continue
+                    # Heuristics: if row contains branch and rank
+                    br = None
+                    cat = None
+                    rank = None
+                    # Some tables: Branch | Category | Closing Rank
+                    if len(cells) >= 2:
+                        # search for a cell that looks like rank
+                        for c in cells:
+                            if re.search(r"\b\d{2,7}\b", c):
+                                rank = parse_int_maybe(c)
+                        # branch candidate is first cell
+                        br = cells[0]
+                        # detect category if present
+                        for c in cells:
+                            if re.search(r"\b(Open|OBC|SC|ST|General)\b", c, re.I):
+                                cat = normalize_category(c)
+                        branches.append((br, cat, rank))
+            # Try lists (ul/li) with text like "Computer Engg - Open - Closing Rank 23456"
+            if not branches:
+                for li in block.find_all("li"):
+                    txt = li.get_text(" ", strip=True)
+                    if re.search(r"\d{2,7}", txt):
+                        br = None
+                        cat = None
+                        rank = None
+                        # branch before '-' or '('
+                        m_br = re.match(r"(.{3,80}?)\s*(?:-|,|\(|:)", txt)
+                        if m_br:
+                            br = m_br.group(1).strip()
+                        if re.search(r"\b(Open|OBC|SC|ST|General)\b", txt, re.I):
+                            cat = normalize_category(re.search(r"\b(Open|OBC|SC|ST|General)\b", txt, re.I).group(1))
+                        rank = parse_int_maybe(txt)
+                        branches.append((br, cat, rank))
+            # If still empty, attempt to use text blocks with keywords "Closing rank" or "Closing Rank"
+            if not branches:
+                bigtxt = block.get_text(" ", strip=True)
+                lines = [ln.strip() for ln in re.split(r"\.\s+|\n", bigtxt) if ln.strip()]
+                for ln in lines:
+                    if "closing" in ln.lower() and re.search(r"\d{2,7}", ln):
+                        br = None
+                        cat = None
+                        rank = parse_int_maybe(ln)
+                        # try capture branch before 'closing'
+                        m = re.match(r"(.{3,60}?)\s+closing", ln, re.I)
+                        if m:
+                            br = m.group(1).strip()
+                        branches.append((br, cat, rank))
+            # Another fallback: if block links to a college details page, follow it and parse table there
+            detail_url = None
+            link = block.find("a", href=True)
+            if link:
+                detail_url = urljoin(page_url, link["href"])
+            # If we have branch tuples, create records
+            if branches:
+                for br, cat, rank in branches:
+                    rec = {
+                        "college": college_name or (link.get("title") if link else None) or "Unknown",
+                        "city": city,
+                        "state": state,
+                        "branch": (br or "Unknown").strip() if br else "Unknown",
+                        "category": normalize_category(cat or "Open"),
+                        "closing_rank": rank,
+                        "fees": None,
+                        "placement_rating": None,
+                        "naac_rating": None,
+                        "source_url": page_url if not detail_url else detail_url,
+                        "source_type": "html",
+                        "retrieved_at": datetime.utcnow().isoformat() + "Z"
+                    }
+                    records.append(rec)
+            else:
+                # As last resort, if college_name exists, push a minimal record (so we don't lose row)
+                if college_name:
+                    rec = {
+                        "college": college_name,
+                        "city": city,
+                        "state": state,
+                        "branch": "All",
+                        "category": "Open",
+                        "closing_rank": None,
+                        "fees": None,
+                        "placement_rating": None,
+                        "naac_rating": None,
+                        "source_url": page_url,
+                        "source_type": "html",
+                        "retrieved_at": datetime.utcnow().isoformat() + "Z"
+                    }
+                    records.append(rec)
         except Exception as e:
-            self.logger.error(f"Error processing PDF {pdf_url}: {e}")
-            return []
+            logger.exception(f"Error parsing a candidate block: {e}")
+    # Deduplicate (college+branch+category)
+    unique = {}
+    for r in records:
+        key = (r.get("college"), r.get("branch"), r.get("category"))
+        if key not in unique:
+            unique[key] = r
+        else:
+            # prefer non-null closing_rank
+            if unique[key].get("closing_rank") is None and r.get("closing_rank") is not None:
+                unique[key] = r
+    deduped = list(unique.values())
+    logger.info(f"Parsed {len(deduped)} deduped records from page {page_url}")
+    return deduped
 
-    def _parse_pdf_table(self, table: List[List[str]]) -> List[Dict[str, Any]]:
-        """Parse cutoff data from PDF table"""
-        cutoffs = []
-        
-        if not table or len(table) < 2:
-            return cutoffs
-            
-        # Identify column structure
-        header_row = table[0]
-        for row in table[1:]:
-            if len(row) >= 2:
-                # Extract numerical ranks
-                for cell in row:
-                    if cell:
-                        rank = self._extract_number(cell)
-                        if rank and 1000 <= rank <= 200000:  # Reasonable MHT-CET rank range
-                            cutoffs.append({
-                                'branch': 'General',
-                                'category': 'Open',
-                                'closing_rank': rank
-                            })
-                            break
-                            
-        return cutoffs
+# ---- Main crawl loop ----
 
-    def _parse_pdf_text(self, text: str) -> List[Dict[str, Any]]:
-        """Parse cutoff data from PDF text content"""
-        cutoffs = []
-        
-        # Look for rank patterns in text
-        import re
-        rank_patterns = [
-            r'(?:closing|cutoff|rank)[\s:]+(\d{4,6})',
-            r'(\d{4,6})[\s]*(?:closing|cutoff|rank)',
-        ]
-        
-        for pattern in rank_patterns:
-            matches = re.findall(pattern, text.lower())
-            for match in matches:
-                rank = int(match)
-                if 1000 <= rank <= 200000:
-                    cutoffs.append({
-                        'branch': 'General',
-                        'category': 'Open',
-                        'closing_rank': rank
-                    })
-                    
-        return cutoffs
+def crawl_predictor(start_url: str = BASE_URL, max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
+    logger.info(f"Starting crawl at {start_url}")
+    url = start_url
+    page_count = 0
+    all_records: List[Dict[str, Any]] = []
+    visited_pages = set()
 
-    def _find_pagination_urls(self, soup: BeautifulSoup, current_url: str) -> List[str]:
-        """Find pagination URLs to continue scraping"""
-        urls = []
-        
-        # Common pagination selectors
-        pagination_selectors = [
-            'a[href*="page"]',
-            '.pagination a',
-            '.pager a',
-            'a[aria-label="Next"]',
-            'a:contains("Next")',
-            'a:contains(">")',
-        ]
-        
-        for selector in pagination_selectors:
-            links = soup.select(selector)
-            for link in links:
-                href = link.get('href')
-                if href and href not in self.scraped_urls:
-                    full_url = urljoin(current_url, href)
-                    urls.append(full_url)
-                    
-        return urls
-
-    def scrape_all_data(self) -> List[CollegeRecord]:
-        """Main scraping orchestration"""
-        self.logger.info("Starting MHT-CET data scraping...")
-        
-        urls_to_process = [self.start_url]
-        processed_count = 0
-        max_pages = 50  # Safety limit
-        
-        while urls_to_process and processed_count < max_pages:
-            url = urls_to_process.pop(0)
-            
-            if url in self.scraped_urls:
-                continue
-                
-            self.logger.info(f"Processing page {processed_count + 1}: {url}")
-            self.scraped_urls.add(url)
-            
-            response = self._fetch_with_retry(url)
-            if not response:
-                continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract college data from current page
-            records = self._parse_college_page(soup, url)
-            self.all_records.extend(records)
-            
-            # Find more pages
-            new_urls = self._find_pagination_urls(soup, url)
-            urls_to_process.extend([u for u in new_urls if u not in self.scraped_urls])
-            
-            # Look for PDF links
-            pdf_links = soup.find_all('a', href=lambda x: x and x.lower().endswith('.pdf'))
-            for pdf_link in pdf_links:
-                pdf_url = urljoin(url, pdf_link.get('href'))
-                self.logger.info(f"Processing PDF: {pdf_url}")
-                pdf_data = self._extract_pdf_data(pdf_url)
-                
-                for pdf_cutoff in pdf_data:
-                    # Create record from PDF data
-                    record = CollegeRecord(
-                        college="Unknown College (PDF)",
-                        city="Unknown City",
-                        state="Maharashtra",
-                        branch=pdf_cutoff.get('branch', 'General'),
-                        category=pdf_cutoff.get('category', 'Open'),
-                        closing_rank=pdf_cutoff.get('closing_rank'),
-                        fees=None,
-                        placement_rating=None,
-                        naac_rating=None,
-                        source_url=pdf_url,
-                        source_type="pdf",
-                        scraped_at=datetime.now().isoformat()
-                    )
-                    self.all_records.append(record)
-            
-            processed_count += 1
-            
-        self.logger.info(f"Scraping completed. Total records: {len(self.all_records)}")
-        return self.all_records
-
-    def save_data(self, output_path: str = "mht_cet_data.json"):
-        """Save scraped data to JSON and optionally Parquet"""
-        # Convert to dictionaries
-        data_dicts = [asdict(record) for record in self.all_records]
-        
-        # Save JSON
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(data_dicts, f, indent=2, ensure_ascii=False)
-        
-        self.logger.info(f"Data saved to {output_path}")
-        
-        # Save Parquet if available
-        if PARQUET_AVAILABLE:
+    while url:
+        if max_pages:
             try:
-                df = pd.DataFrame(data_dicts)
-                parquet_path = output_path.replace('.json', '.parquet')
-                df.to_parquet(parquet_path, index=False)
-                self.logger.info(f"Data also saved to {parquet_path}")
+                if page_count >= int(max_pages):
+                    logger.info(f"Reached MAX_PAGES={max_pages}. Stopping crawl.")
+                    break
+            except Exception:
+                pass
+
+        if url in visited_pages:
+            logger.info(f"Encountered already visited page {url}. Stopping pagination loop.")
+            break
+        visited_pages.add(url)
+
+        resp = safe_get(url)
+        if not resp:
+            logger.error(f"Failed to fetch {url}. Stopping.")
+            break
+
+        polite_sleep()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # parse page-level PDFs (some pages may link to a brochure)
+        pdf_links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().endswith(".pdf"):
+                pdf_links.append(urljoin(url, href))
+        # parse HTML records from page
+        page_records = parse_college_cards(soup, url)
+        all_records.extend(page_records)
+
+        # Try to parse PDFs linked directly on the page
+        for pdf_url in set(pdf_links):
+            try:
+                logger.info(f"Downloading PDF brochure: {pdf_url}")
+                pdf_resp = safe_get(pdf_url)
+                if pdf_resp and pdf_resp.content:
+                    # attempt to extract table rows
+                    pdf_recs = []
+                    if pdfplumber:
+                        import io
+                        pdf_recs = extract_from_pdf_bytes(pdf_resp.content, pdf_url)
+                    else:
+                        logger.debug("pdfplumber not installed; skipping pdf contents extraction.")
+                        # still add a record noting pdf existence
+                        pdf_recs = [{
+                            "college": None,
+                            "city": None,
+                            "state": None,
+                            "branch": "Unknown",
+                            "category": "Open",
+                            "closing_rank": None,
+                            "fees": None,
+                            "placement_rating": None,
+                            "naac_rating": None,
+                            "source_url": pdf_url,
+                            "source_type": "pdf",
+                            "retrieved_at": datetime.utcnow().isoformat() + "Z"
+                        }]
+                    all_records.extend(pdf_recs)
+                polite_sleep()
             except Exception as e:
-                self.logger.warning(f"Could not save Parquet: {e}")
+                logger.exception(f"Error processing PDF {pdf_url}: {e}")
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Get scraping statistics"""
-        if not self.all_records:
-            return {}
-            
-        df = pd.DataFrame([asdict(r) for r in self.all_records])
-        
-        return {
-            'total_records': len(self.all_records),
-            'unique_colleges': df['college'].nunique(),
-            'unique_branches': df['branch'].nunique(),
-            'categories': df['category'].value_counts().to_dict(),
-            'source_types': df['source_type'].value_counts().to_dict(),
-            'records_with_ranks': df['closing_rank'].notna().sum(),
-            'rank_range': {
-                'min': df['closing_rank'].min(),
-                'max': df['closing_rank'].max(),
-                'mean': df['closing_rank'].mean()
-            } if df['closing_rank'].notna().any() else None
-        }
+        # find next page via pagination heuristics
+        next_page = find_pagination_next(soup, url)
+        page_count += 1
+        if next_page:
+            parsed = urlparse(next_page)
+            if not parsed.scheme:
+                next_page = urljoin(url, next_page)
+            url = next_page
+            logger.info(f"Next page -> {url}")
+        else:
+            logger.info("No next page found. Finishing crawl.")
+            break
 
+    # Postprocess: normalize fields and remove blatantly invalid entries
+    normalized = []
+    seen_keys = set()
+    for r in all_records:
+        college = (r.get("college") or "").strip() if r.get("college") else None
+        branch = (r.get("branch") or "All").strip()
+        category = normalize_category(r.get("category") or "Open")
+        key = (college, branch, category)
+        if not college:
+            logger.debug("Skipping record with missing college name.")
+            continue
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        normalized.append({
+            "college": college,
+            "city": r.get("city"),
+            "state": r.get("state"),
+            "branch": branch,
+            "category": category,
+            "closing_rank": r.get("closing_rank"),
+            "fees": r.get("fees"),
+            "placement_rating": r.get("placement_rating"),
+            "naac_rating": r.get("naac_rating"),
+            "source_url": r.get("source_url"),
+            "source_type": r.get("source_type") or "html",
+            "retrieved_at": r.get("retrieved_at") or datetime.utcnow().isoformat() + "Z"
+        })
+    logger.info(f"Crawl finished. Total normalized records: {len(normalized)}")
+    return normalized
+
+# ---- Save outputs ----
+
+def save_json(records: List[Dict[str, Any]], path: pathlib.Path):
+    logger.info(f"Writing {len(records)} records to JSON: {path}")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+def save_parquet(records: List[Dict[str, Any]], path: pathlib.Path):
+    if not PANDAS_AVAILABLE:
+        logger.warning("Pandas not available; skipping parquet output.")
+        return
+    try:
+        df = pd.DataFrame(records)
+        df.to_parquet(path, index=False)
+        logger.info(f"Wrote parquet to {path}")
+    except Exception as e:
+        logger.exception(f"Failed to write parquet: {e}")
+
+# ---- Command-line entrypoint ----
 
 def main():
-    """Main execution function"""
-    scraper = MHTCETScraper()
-    
-    try:
-        # Run scraping
-        records = scraper.scrape_all_data()
-        
-        # Save results
-        scraper.save_data()
-        
-        # Print statistics
-        stats = scraper.get_stats()
-        print("\nScraping Statistics:")
-        print(json.dumps(stats, indent=2, default=str))
-        
-    except KeyboardInterrupt:
-        print("\nScraping interrupted by user")
-        if scraper.all_records:
-            print("Saving partial results...")
-            scraper.save_data("mht_cet_data_partial.json")
-    except Exception as e:
-        logging.error(f"Scraping failed: {e}")
-        raise
+    import argparse
+    parser = argparse.ArgumentParser(description="MHT-CET cutoff scraper (Shiksha predictor)")
+    parser.add_argument("--start-url", default=BASE_URL, help="Start URL (default shiksha predictor)")
+    parser.add_argument("--max-pages", default=MAX_PAGES, help="Optional max pages to crawl (int)")
+    parser.add_argument("--out-json", default=str(OUTPUT_DIR / "mht_cet_data.json"), help="Output JSON path")
+    parser.add_argument("--out-parquet", default=str(OUTPUT_DIR / "mht_cet_data.parquet"), help="Output parquet path")
+    parser.add_argument("--no-parquet", action="store_true", help="Do not try to write parquet even if pandas present")
+    args = parser.parse_args()
 
+    mp = None
+    if args.max_pages:
+        try:
+            mp = int(args.max_pages)
+        except Exception:
+            mp = None
+
+    records = crawl_predictor(start_url=args.start_url, max_pages=mp)
+    save_json(records, pathlib.Path(args.out_json))
+    if not args.no_parquet:
+        save_parquet(records, pathlib.Path(args.out_parquet))
+    logger.info("Done.")
 
 if __name__ == "__main__":
     main()
