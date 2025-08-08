@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CET-Mentor v2.0</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="color-scheme" content="dark" />
+  <style>
+    ::-webkit-scrollbar{width:10px;height:10px}
+    ::-webkit-scrollbar-track{background:#0b0f19}
+    ::-webkit-scrollbar-thumb{background:#374151;border-radius:6px}
+    ::-webkit-scrollbar-thumb:hover{background:#4b5563}
+    .fade-in{animation:fadeIn .2s ease-in both}
+    @keyframes fadeIn{from{opacity:.0;transform:translateY(4px)}to{opacity:1;transform:none}}
+    .typing-dot{animation:blink 1.2s infinite}
+    @keyframes blink{0%{opacity:.2}20%{opacity:1}100%{opacity:.2}}
+  </style>
+</head>
+<body class="bg-[#0b0f19] text-gray-200 min-h-screen">
+  <div class="mx-auto max-w-5xl px-4 py-6">
+    <header class="flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <div class="h-10 w-10 rounded-xl bg-gradient-to-br from-purple-600 to-indigo-600 grid place-items-center text-white font-extrabold">CM</div>
+        <div>
+          <h1 class="text-xl font-bold text-white">CET-Mentor v2.0</h1>
+          <p class="text-sm text-purple-300">Your AI-powered MHT-CET admissions assistant</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="clear-btn" class="text-xs rounded-lg bg-gray-800 hover:bg-gray-700 px-3 py-2 border border-gray-700">Clear</button>
+        <a href="/healthz" target="_blank" class="text-xs rounded-lg bg-gray-800 hover:bg-gray-700 px-3 py-2 border border-gray-700">Health</a>
+      </div>
+    </header>
+
+    <main class="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <!-- Chat panel -->
+      <section class="lg:col-span-2 bg-[#0e1424] border border-gray-800 rounded-2xl overflow-hidden">
+        <div id="messages" class="h-[65vh] overflow-y-auto p-4 space-y-4">
+          <div class="fade-in">
+            <div class="inline-block rounded-2xl bg-gray-800/70 border border-gray-700 px-4 py-3 max-w-2xl">
+              <p class="leading-relaxed">Hello! I'm <span class="font-semibold text-white">CET-Mentor</span>. Share your MHT-CET rank to get college suggestions, or ask a question about the admissions process. I work with ranks (lower is better) and ground answers in verified data when available.</p>
+            </div>
+          </div>
+        </div>
+        <div class="border-t border-gray-800 p-3">
+          <div class="flex items-end gap-2">
+            <input id="input" type="text" placeholder="Enter your rank (e.g., 15234) or ask a question..." class="flex-1 rounded-xl bg-gray-900/70 border border-gray-800 focus:border-purple-600 focus:ring-2 focus:ring-purple-500/40 outline-none px-4 py-3 text-sm" />
+            <button id="send" class="rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 px-4 py-3 text-sm font-semibold">Send</button>
+          </div>
+          <div class="mt-2 flex items-center justify-between text-xs text-gray-400">
+            <p>Tip: Send a number to get suggestions. Example: <span class="text-gray-300">12000</span></p>
+            <div class="flex items-center gap-2">
+              <label class="inline-flex items-center gap-2"><input id="auto-scroll" type="checkbox" checked class="accent-purple-600"/><span>Auto scroll</span></label>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Rank suggestions panel -->
+      <aside class="bg-[#0e1424] border border-gray-800 rounded-2xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+          <h2 class="text-sm font-semibold">Quick Rank Suggestion</h2>
+          <span class="text-[10px] text-gray-400">Data-driven</span>
+        </div>
+        <div class="p-4 space-y-3">
+          <div class="flex items-center gap-2">
+            <input id="rank-input" type="number" min="1" placeholder="Enter your rank" class="w-full rounded-lg bg-gray-900/70 border border-gray-800 focus:border-purple-600 focus:ring-2 focus:ring-purple-500/40 outline-none px-3 py-2 text-sm" />
+            <button id="rank-btn" class="rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 px-3 py-2 text-sm">Go</button>
+          </div>
+          <div id="suggestions" class="space-y-4 text-sm"></div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="mt-6 text-center text-xs text-gray-500">
+      Built with <span class="text-purple-400">Flask</span> · Tailwind · OpenRouter
+    </footer>
+  </div>
+
+  <script>
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    const clearBtn = document.getElementById('clear-btn');
+    const rankInputEl = document.getElementById('rank-input');
+    const rankBtn = document.getElementById('rank-btn');
+    const suggestionsEl = document.getElementById('suggestions');
+    const autoScrollEl = document.getElementById('auto-scroll');
+
+    function scrollToBottom(){
+      if(!autoScrollEl.checked) return;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function messageBubble(html, role){
+      const wrap = document.createElement('div');
+      wrap.className = 'fade-in';
+      const bubble = document.createElement('div');
+      bubble.className = `inline-block rounded-2xl px-4 py-3 max-w-2xl border ${role==='user' ? 'bg-purple-600/20 border-purple-700' : 'bg-gray-800/70 border-gray-700'}`;
+      bubble.innerHTML = html;
+      wrap.appendChild(bubble);
+      messagesEl.appendChild(wrap);
+      scrollToBottom();
+      return bubble;
+    }
+
+    function toHtml(text){
+      return text
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br/>');
+    }
+
+    async function fetchSuggestions(rank){
+      const thinking = messageBubble('<em class="text-gray-400">Finding college suggestions...</em>', 'bot');
+      try{
+        const res = await fetch('/suggest', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rank})});
+        const data = await res.json();
+        if(data.error){
+          thinking.innerHTML = `<span class='text-red-400'>${data.error}</span>`;
+          return;
+        }
+        let html = `<div class='space-y-2'>`;
+        html += `<div><span class='text-gray-400'>Rank:</span> <span class='font-semibold text-white'>${rank}</span></div>`;
+        if(data.safe_options?.length){
+          html += `<div><div class='text-green-400 font-semibold mb-1'>Good Possibilities</div><ul class='list-disc list-inside space-y-1'>${data.safe_options.map(c=>`<li>${c.college} <span class='text-gray-400'>(Closing Rank: ${c.closing_rank ?? 'NA'})</span></li>`).join('')}</ul></div>`;
+        }
+        if(data.ambitious_options?.length){
+          html += `<div class='mt-2'><div class='text-yellow-300 font-semibold mb-1'>Ambitious</div><ul class='list-disc list-inside space-y-1'>${data.ambitious_options.map(c=>`<li>${c.college} <span class='text-gray-400'>(Closing Rank: ${c.closing_rank ?? 'NA'})</span></li>`).join('')}</ul></div>`;
+        }
+        if(!data.safe_options?.length && !data.ambitious_options?.length){
+          html += `<div class='text-gray-400'>No suggestions found for this rank.</div>`;
+        }
+        html += `</div>`;
+        thinking.innerHTML = html;
+      }catch(err){
+        thinking.innerHTML = `<span class='text-red-400'>Could not fetch suggestions.</span>`;
+      }
+    }
+
+    async function sendMessage(){
+      const text = inputEl.value.trim();
+      if(!text) return;
+      messageBubble(text.replace(/</g,'&lt;').replace(/>/g,'&gt;'), 'user');
+      inputEl.value = '';
+
+      if(/^\d{1,7}$/.test(text)){
+        await fetchSuggestions(parseInt(text,10));
+        return;
+      }
+
+      const bot = messageBubble('<span class="typing-dot">•</span> <span class="typing-dot">•</span> <span class="typing-dot">•</span>', 'bot');
+      bot.innerHTML = '';
+      try{
+        const res = await fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message: text})});
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let full = '';
+        while(true){
+          const {value, done} = await reader.read();
+          if(done) break;
+          const chunk = decoder.decode(value);
+          chunk.split('\n').forEach(line=>{
+            if(line.startsWith('data:')){
+              try{
+                const data = JSON.parse(line.slice(5));
+                if(data.content){
+                  full += data.content;
+                  bot.innerHTML = toHtml(full);
+                }
+                if(data.error){
+                  bot.innerHTML = `<span class='text-red-400'>${data.error}</span>`;
+                }
+              }catch(_){/* ignore */}
+            }
+          });
+          scrollToBottom();
+        }
+      }catch(err){
+        bot.innerHTML = `<span class='text-red-400'>Failed to reach the AI service.</span>`;
+      }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', e=>{ if(e.key==='Enter') sendMessage(); });
+    clearBtn.addEventListener('click', ()=>{ messagesEl.innerHTML = ''; });
+    rankBtn.addEventListener('click', ()=>{
+      const v = parseInt((rankInputEl.value||'').trim(), 10);
+      if(!v || v<=0){
+        suggestionsEl.innerHTML = `<div class='text-red-400 text-xs'>Enter a valid positive rank.</div>`;
+        return;
+      }
+      suggestionsEl.innerHTML = `<div class='text-xs text-gray-400'>Fetching…</div>`;
+      fetch('/suggest', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rank: v})})
+        .then(r=>r.json())
+        .then(data=>{
+          if(data.error){
+            suggestionsEl.innerHTML = `<div class='text-red-400 text-xs'>${data.error}</div>`;
+            return;
+          }
+          let html = '';
+          if(data.safe_options?.length){
+            html += `<div class='rounded-xl border border-gray-800 bg-gray-900/30 p-3'><div class='text-green-400 font-semibold mb-1'>Good Possibilities</div><ul class='list-disc list-inside space-y-1'>${data.safe_options.map(c=>`<li>${c.college} <span class='text-gray-400'>(Closing: ${c.closing_rank ?? 'NA'})</span></li>`).join('')}</ul></div>`;
+          }
+          if(data.ambitious_options?.length){
+            html += `<div class='rounded-xl border border-gray-800 bg-gray-900/30 p-3 mt-2'><div class='text-yellow-300 font-semibold mb-1'>Ambitious</div><ul class='list-disc list-inside space-y-1'>${data.ambitious_options.map(c=>`<li>${c.college} <span class='text-gray-400'>(Closing: ${c.closing_rank ?? 'NA'})</span></li>`).join('')}</ul></div>`;
+          }
+          if(!html){ html = `<div class='text-xs text-gray-400'>No suggestions found.</div>`; }
+          suggestionsEl.innerHTML = html;
+        })
+        .catch(()=>{
+          suggestionsEl.innerHTML = `<div class='text-red-400 text-xs'>Error fetching suggestions.</div>`;
+        });
+    });
+  </script>
+</body>
+</html>
