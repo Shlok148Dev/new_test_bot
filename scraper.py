@@ -1,590 +1,584 @@
-# scraper.py
+#!/usr/bin/env python3
 """
-Purpose:
-    Resilient scraper to harvest MHT-CET cutoff information from Shiksha's college predictor pages.
-    Produces `mht_cet_data.json` and (optionally) `mht_cet_data.parquet`.
+Vector Store for MHT-CET College RAG System
 
-How to run:
-    1. Create and populate a .env file (see .env.example later in the project).
-    2. Install dependencies: `pip install -r requirements.txt`
-    3. Run: `python scraper.py`
-    4. Output files will be written to ./data/mht_cet_data.json and ./data/mht_cet_data.parquet (if pandas/pyarrow installed).
+Purpose: Build and manage FAISS vector index for semantic retrieval of college data
+Supports both local sentence-transformers and OpenAI/OpenRouter embeddings
+Includes evaluation utilities to measure retrieval performance (F1 score)
 
-Environment variables (via .env):
-    - USER_AGENT (optional): user agent string to use for requests. A default is provided.
-    - REQUEST_MIN_DELAY (optional): minimum polite delay between requests in seconds (default 1.5).
-    - REQUEST_MAX_DELAY (optional): maximum polite delay between requests in seconds (default 3.0).
-    - MAX_PAGES (optional): optional limit to pages for testing; default None (crawl until pagination ends).
-    - OUTPUT_DIR (optional): output directory (default ./data).
+Usage:
+    # Build index
+    python vector_store.py --build --data mht_cet_data.json
+    
+    # Test retrieval
+    python vector_store.py --test "vjti mumbai computer science"
 
-Notes / behavior:
-    - Respects polite delays and exponential backoff on 429/5xx responses.
-    - Uses robust parsing heuristics (CSS selectors + text matching + DOM-relative traversal).
-    - If a PDF cutoff brochure is found, downloads and attempts table/text extraction via pdfplumber.
-    - Logs progress, warnings, and parse misses to stdout and `scraper.log`.
-    - Schema per record: {
-          "college": str,
-          "city": Optional[str],
-          "state": Optional[str],
-          "branch": str,
-          "category": str,          # e.g., Open/OBC/SC/ST
-          "closing_rank": Optional[int],
-          "fees": Optional[str],
-          "placement_rating": Optional[float],
-          "naac_rating": Optional[str],
-          "source_url": str,
-          "source_type": "html"|"pdf",
-          "retrieved_at": ISO8601 timestamp
-      }
+Environment Variables:
+    EMBEDDINGS_MODE=local|openai       # Embedding provider
+    EMBEDDINGS_MODEL=all-MiniLM-L6-v2  # Model name
+    OPENAI_API_KEY=your_key            # If using OpenAI embeddings
+    VECTOR_INDEX_PATH=index.faiss      # Index save location
+    VECTOR_METADATA_PATH=metadata.json # Metadata save location
+
+Dependencies:
+    pip install sentence-transformers faiss-cpu numpy scikit-learn
+    # Optional: openai for hosted embeddings
 """
 
-import os
-import re
-import time
 import json
-import math
 import logging
-import random
-import pathlib
-from typing import List, Dict, Optional, Tuple, Any
-from datetime import datetime
-from urllib.parse import urljoin, urlparse
+import os
+import pickle
+import time
+from typing import List, Dict, Any, Optional, Tuple
+import argparse
+from dataclasses import dataclass
 
-import requests
-from bs4 import BeautifulSoup
+import numpy as np
+import faiss
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import precision_recall_fscore_support
 
-# Optional PDF parsing; handle import errors gracefully
+# Embedding providers
 try:
-    import pdfplumber
-except Exception:
-    pdfplumber = None
+    from sentence_transformers import SentenceTransformer
+    LOCAL_EMBEDDINGS = True
+except ImportError:
+    LOCAL_EMBEDDINGS = False
+    logging.warning("sentence-transformers not available - local embeddings disabled")
 
-# Optional parquet output
 try:
-    import pandas as pd  # type: ignore
-    PANDAS_AVAILABLE = True
-except Exception:
-    PANDAS_AVAILABLE = False
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
-# ---- Configuration (overridable by environment) ----
-BASE_URL = "https://www.shiksha.com/engineering/mht-cet-college-predictor"
-USER_AGENT = os.getenv("USER_AGENT",
-                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0 Safari/537.36 CET-Mentor-Scraper/1.0")
-REQUEST_MIN_DELAY = float(os.getenv("REQUEST_MIN_DELAY", "1.5"))
-REQUEST_MAX_DELAY = float(os.getenv("REQUEST_MAX_DELAY", "3.0"))
-MAX_PAGES = os.getenv("MAX_PAGES")  # optional: for testing
-OUTPUT_DIR = pathlib.Path(os.getenv("OUTPUT_DIR", "./data"))
-LOG_FILE = "scraper.log"
 
-# Create output dir
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+@dataclass
+class RetrievalResult:
+    """Single retrieval result with metadata"""
+    record_id: int
+    score: float
+    college: str
+    branch: str
+    category: str
+    closing_rank: Optional[int]
+    city: str
+    source_url: str
+    full_record: Dict[str, Any]
 
-# Logging
-logger = logging.getLogger("mht_cet_scraper")
-logger.setLevel(logging.DEBUG)
-fh = logging.FileHandler(LOG_FILE)
-fh.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
-fh.setFormatter(formatter)
-ch.setFormatter(formatter)
-logger.addHandler(fh)
-logger.addHandler(ch)
 
-# Session with default headers
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
+class VectorStore:
+    """FAISS-based vector store for college data semantic retrieval"""
+    
+    def __init__(self, 
+                 embeddings_mode: str = "local",
+                 embeddings_model: str = "all-MiniLM-L6-v2",
+                 index_path: str = "index.faiss",
+                 metadata_path: str = "metadata.json"):
+        """
+        Initialize vector store
+        
+        Args:
+            embeddings_mode: "local" or "openai"
+            embeddings_model: Model name/path
+            index_path: Path to save/load FAISS index
+            metadata_path: Path to save/load record metadata
+        """
+        self.embeddings_mode = embeddings_mode
+        self.embeddings_model = embeddings_model
+        self.index_path = index_path
+        self.metadata_path = metadata_path
+        
+        # Initialize embedding provider
+        self.embedder = None
+        self.embedding_dim = None
+        self.index = None
+        self.metadata = {}  # id -> record mapping
+        
+        # Logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        self._initialize_embeddings()
 
-# Rate limiting helpers
-def polite_sleep():
-    delay = random.uniform(REQUEST_MIN_DELAY, REQUEST_MAX_DELAY)
-    logger.debug(f"Sleeping for {delay:.2f}s to be polite.")
-    time.sleep(delay)
-
-def exponential_backoff(attempt: int, base: float = 1.0, cap: float = 32.0):
-    sleep = min(cap, base * (2 ** attempt) + random.random())
-    logger.warning(f"Backoff sleep for {sleep:.1f}s (attempt {attempt}).")
-    time.sleep(sleep)
-
-# Utility: safe request with retries
-def safe_get(url: str, max_retries: int = 5, timeout: int = 20) -> Optional[requests.Response]:
-    attempt = 0
-    while attempt <= max_retries:
-        try:
-            logger.info(f"GET {url} (attempt {attempt + 1})")
-            resp = SESSION.get(url, timeout=timeout)
-            if resp.status_code == 200:
-                return resp
-            if resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning(f"Server returned {resp.status_code} for {url}")
-                exponential_backoff(attempt)
-                attempt += 1
-                continue
-            logger.error(f"Unexpected status {resp.status_code} for {url}")
-            return resp
-        except requests.RequestException as e:
-            logger.exception(f"Request exception for {url}: {e}")
-            exponential_backoff(attempt)
-            attempt += 1
-    logger.error(f"Exceeded max retries for {url}")
-    return None
-
-# ---- Parsing helpers ----
-
-def text_or_none(el) -> Optional[str]:
-    if not el:
-        return None
-    txt = el.get_text(separator=" ", strip=True)
-    return txt if txt else None
-
-def parse_int_maybe(s: Optional[str]) -> Optional[int]:
-    if not s:
-        return None
-    # Remove commas, non-digits
-    m = re.search(r"(\d{1,7})", s.replace(",", ""))
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-def parse_float_maybe(s: Optional[str]) -> Optional[float]:
-    if not s:
-        return None
-    m = re.search(r"(\d+(?:\.\d+)?)", s.replace(",", ""))
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-def normalize_category(cat: str) -> str:
-    # canonical categories
-    cat = (cat or "").strip().lower()
-    if not cat:
-        return "Open"
-    if "open" in cat:
-        return "Open"
-    if "obc" in cat:
-        return "OBC"
-    if "sc" in cat and "st" not in cat:
-        return "SC"
-    if "st" in cat:
-        return "ST"
-    return cat.title()
-
-# Extract PDF tables/text and try to find (college, branch, category, closing rank)
-def extract_from_pdf_bytes(pdf_bytes: bytes, source_url: str) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
-    if not pdfplumber:
-        logger.warning("pdfplumber not available; skipping PDF parsing.")
-        return results
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text_all = []
-            for p in pdf.pages:
-                try:
-                    # Try table extraction
-                    tables = p.extract_tables()
-                    if tables:
-                        for table in tables:
-                            # Flatten table rows and attempt to detect common patterns
-                            for row in table:
-                                row_text = " | ".join([cell or "" for cell in row])
-                                text_all.append(row_text)
-                    # Also append raw text for regex parsing
-                    t = p.extract_text()
-                    if t:
-                        text_all.append(t)
-                except Exception as e:
-                    logger.debug(f"pdf page parse error: {e}")
-            combined = "\n".join(text_all)
-            # Heuristic: find lines mentioning branch & category & rank
-            lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
-            for ln in lines:
-                # Simple heuristics: "Computer Engineering ... Open 23567"
-                m = re.search(r"(?P<branch>[A-Za-z &/-]{3,60}).{0,20}(?P<cat>Open|OBC|SC|ST|General)?.{0,20}(?P<rank>\d{2,7})", ln, re.I)
-                if m:
-                    rec = {
-                        "college": None,
-                        "city": None,
-                        "state": None,
-                        "branch": m.group("branch").strip(),
-                        "category": normalize_category(m.group("cat") or "Open"),
-                        "closing_rank": parse_int_maybe(m.group("rank")),
-                        "fees": None,
-                        "placement_rating": None,
-                        "naac_rating": None,
-                        "source_url": source_url,
-                        "source_type": "pdf",
-                        "retrieved_at": datetime.utcnow().isoformat() + "Z"
-                    }
-                    results.append(rec)
-            logger.info(f"Extracted {len(results)} candidate rows from PDF {source_url}")
-    except Exception as e:
-        logger.exception(f"PDF parsing failed for {source_url}: {e}")
-    return results
-
-# ---- HTML parsing for a page ----
-
-def find_pagination_next(soup: BeautifulSoup, base_url: str) -> Optional[str]:
-    # Try common patterns: rel="next", anchor text Next, aria-label next, or page links
-    next_link = soup.find("link", {"rel": "next"})
-    if next_link and next_link.get("href"):
-        return urljoin(base_url, next_link["href"])
-    # anchor with rel next
-    a = soup.find("a", attrs={"rel": "next"})
-    if a and a.get("href"):
-        return urljoin(base_url, a["href"])
-    # Look for 'Next' text buttons
-    for a in soup.find_all("a", href=True):
-        if a.get_text(strip=True).lower() in ("next", ">", ">>"):
-            return urljoin(base_url, a["href"])
-    # last resort: find pagination and pick next based on 'active' class
-    pag = soup.select_one(".pagination, .pagnation, ul.pagination")
-    if pag:
-        active = pag.select_one(".active")
-        if active:
-            nxt = active.find_next_sibling("li")
-            if nxt and nxt.find("a") and nxt.find("a").get("href"):
-                return urljoin(base_url, nxt.find("a")["href"])
-    return None
-
-def parse_college_cards(soup: BeautifulSoup, page_url: str) -> List[Dict[str, Any]]:
-    """
-    Parse college/row cards from the predictor list page.
-    This function uses heuristics, because site structure may change.
-    """
-    records: List[Dict[str, Any]] = []
-    # Typical blocks: article cards, results list, table rows
-    candidates = []
-    # Candidate selectors to try
-    selectors = [
-        "div.college-card, div.predictor-card, div.result-card, div.college-list-item",
-        "article, .srp-card, .listing-card",
-        "div[class*='college'], div[class*='card']"
-    ]
-    for sel in selectors:
-        found = soup.select(sel)
-        if found:
-            candidates = found
-            logger.debug(f"Found {len(found)} candidates with selector '{sel}'")
-            break
-    if not candidates:
-        # fallback: search for rows with college names (heuristic)
-        for h in soup.find_all(re.compile("^h[1-6]$")):
-            if h.get_text(strip=True) and len(h.get_text(strip=True)) < 120:
-                parent = h.find_parent()
-                if parent:
-                    candidates.append(parent)
-    logger.info(f"Parsing {len(candidates)} candidate blocks from {page_url}")
-
-    for block in candidates:
-        try:
-            # Attempt multiple strategies to pull data
-            college_name = None
-            # priority: anchor with college name
-            a = block.find("a", href=True, text=True)
-            if a and len(a.get_text(strip=True)) > 3:
-                college_name = a.get_text(strip=True)
-            if not college_name:
-                # headings inside block
-                h = block.find(["h2", "h3", "h4"])
-                if h:
-                    college_name = h.get_text(strip=True)
-            # try meta info
-            city = None
-            state = None
-            # Often location is in a span or small tag
-            loc = block.find(lambda tag: tag.name in ("span", "p", "small") and "location" in (tag.get("class") or []) )
-            if not loc:
-                # text that contains comma separated location like "Mumbai, Maharashtra"
-                text_nodes = block.find_all(text=True)
-                for t in text_nodes:
-                    if "," in t and len(t) < 60 and any(k in t.lower() for k in ("mumbai","pune","nagpur","nashik","thane","aurangabad","maharashtra")):
-                        parts = [p.strip() for p in t.split(",") if p.strip()]
-                        if parts:
-                            city = parts[0]
-                            if len(parts) >= 2:
-                                state = parts[1]
-                                break
-            # Branches/department and cutoff info
-            # Look for small tables or lists inside block
-            branches = []
-            # Try to find table rows in block
-            for table in block.find_all("table"):
-                for tr in table.find_all("tr"):
-                    cells = [td.get_text(separator=" ", strip=True) for td in tr.find_all(["th","td"])]
-                    if not cells:
-                        continue
-                    # Heuristics: if row contains branch and rank
-                    br = None
-                    cat = None
-                    rank = None
-                    # Some tables: Branch | Category | Closing Rank
-                    if len(cells) >= 2:
-                        # search for a cell that looks like rank
-                        for c in cells:
-                            if re.search(r"\b\d{2,7}\b", c):
-                                rank = parse_int_maybe(c)
-                        # branch candidate is first cell
-                        br = cells[0]
-                        # detect category if present
-                        for c in cells:
-                            if re.search(r"\b(Open|OBC|SC|ST|General)\b", c, re.I):
-                                cat = normalize_category(c)
-                        branches.append((br, cat, rank))
-            # Try lists (ul/li) with text like "Computer Engg - Open - Closing Rank 23456"
-            if not branches:
-                for li in block.find_all("li"):
-                    txt = li.get_text(" ", strip=True)
-                    if re.search(r"\d{2,7}", txt):
-                        br = None
-                        cat = None
-                        rank = None
-                        # branch before '-' or '('
-                        m_br = re.match(r"(.{3,80}?)\s*(?:-|,|\(|:)", txt)
-                        if m_br:
-                            br = m_br.group(1).strip()
-                        if re.search(r"\b(Open|OBC|SC|ST|General)\b", txt, re.I):
-                            cat = normalize_category(re.search(r"\b(Open|OBC|SC|ST|General)\b", txt, re.I).group(1))
-                        rank = parse_int_maybe(txt)
-                        branches.append((br, cat, rank))
-            # If still empty, attempt to use text blocks with keywords "Closing rank" or "Closing Rank"
-            if not branches:
-                bigtxt = block.get_text(" ", strip=True)
-                lines = [ln.strip() for ln in re.split(r"\.\s+|\n", bigtxt) if ln.strip()]
-                for ln in lines:
-                    if "closing" in ln.lower() and re.search(r"\d{2,7}", ln):
-                        br = None
-                        cat = None
-                        rank = parse_int_maybe(ln)
-                        # try capture branch before 'closing'
-                        m = re.match(r"(.{3,60}?)\s+closing", ln, re.I)
-                        if m:
-                            br = m.group(1).strip()
-                        branches.append((br, cat, rank))
-            # Another fallback: if block links to a college details page, follow it and parse table there
-            detail_url = None
-            link = block.find("a", href=True)
-            if link:
-                detail_url = urljoin(page_url, link["href"])
-            # If we have branch tuples, create records
-            if branches:
-                for br, cat, rank in branches:
-                    rec = {
-                        "college": college_name or (link.get("title") if link else None) or "Unknown",
-                        "city": city,
-                        "state": state,
-                        "branch": (br or "Unknown").strip() if br else "Unknown",
-                        "category": normalize_category(cat or "Open"),
-                        "closing_rank": rank,
-                        "fees": None,
-                        "placement_rating": None,
-                        "naac_rating": None,
-                        "source_url": page_url if not detail_url else detail_url,
-                        "source_type": "html",
-                        "retrieved_at": datetime.utcnow().isoformat() + "Z"
-                    }
-                    records.append(rec)
-            else:
-                # As last resort, if college_name exists, push a minimal record (so we don't lose row)
-                if college_name:
-                    rec = {
-                        "college": college_name,
-                        "city": city,
-                        "state": state,
-                        "branch": "All",
-                        "category": "Open",
-                        "closing_rank": None,
-                        "fees": None,
-                        "placement_rating": None,
-                        "naac_rating": None,
-                        "source_url": page_url,
-                        "source_type": "html",
-                        "retrieved_at": datetime.utcnow().isoformat() + "Z"
-                    }
-                    records.append(rec)
-        except Exception as e:
-            logger.exception(f"Error parsing a candidate block: {e}")
-    # Deduplicate (college+branch+category)
-    unique = {}
-    for r in records:
-        key = (r.get("college"), r.get("branch"), r.get("category"))
-        if key not in unique:
-            unique[key] = r
+    def _initialize_embeddings(self):
+        """Initialize embedding model based on configuration"""
+        if self.embeddings_mode == "local":
+            if not LOCAL_EMBEDDINGS:
+                raise ImportError("sentence-transformers required for local embeddings")
+            
+            self.logger.info(f"Loading local embedding model: {self.embeddings_model}")
+            self.embedder = SentenceTransformer(self.embeddings_model)
+            self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
+            
+        elif self.embeddings_mode == "openai":
+            if not OPENAI_AVAILABLE:
+                raise ImportError("openai package required for OpenAI embeddings")
+            
+            # Set up OpenAI client
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY environment variable required")
+            
+            openai.api_key = api_key
+            self.embedding_dim = 1536  # OpenAI ada-002 dimension
+            self.logger.info("Using OpenAI embeddings")
+            
         else:
-            # prefer non-null closing_rank
-            if unique[key].get("closing_rank") is None and r.get("closing_rank") is not None:
-                unique[key] = r
-    deduped = list(unique.values())
-    logger.info(f"Parsed {len(deduped)} deduped records from page {page_url}")
-    return deduped
+            raise ValueError(f"Unsupported embeddings_mode: {self.embeddings_mode}")
 
-# ---- Main crawl loop ----
+    def embed_texts(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """
+        Generate embeddings for list of texts
+        
+        Args:
+            texts: List of text strings to embed
+            batch_size: Batch size for processing
+            
+        Returns:
+            numpy array of embeddings [n_texts, embedding_dim]
+        """
+        if not texts:
+            return np.array([]).reshape(0, self.embedding_dim)
+            
+        if self.embeddings_mode == "local":
+            return self._embed_local(texts, batch_size)
+        elif self.embeddings_mode == "openai":
+            return self._embed_openai(texts, batch_size)
 
-def crawl_predictor(start_url: str = BASE_URL, max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
-    logger.info(f"Starting crawl at {start_url}")
-    url = start_url
-    page_count = 0
-    all_records: List[Dict[str, Any]] = []
-    visited_pages = set()
+    def _embed_local(self, texts: List[str], batch_size: int) -> np.ndarray:
+        """Generate embeddings using local sentence-transformers"""
+        embeddings = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_embeddings = self.embedder.encode(batch, convert_to_numpy=True)
+            embeddings.append(batch_embeddings)
+            
+            if len(embeddings) % 10 == 0:
+                self.logger.info(f"Processed {len(embeddings) * batch_size} texts")
+        
+        result = np.vstack(embeddings)
+        
+        # Normalize embeddings for cosine similarity
+        norms = np.linalg.norm(result, axis=1, keepdims=True)
+        result = result / (norms + 1e-8)
+        
+        return result
 
-    while url:
-        if max_pages:
+    def _embed_openai(self, texts: List[str], batch_size: int) -> np.ndarray:
+        """Generate embeddings using OpenAI API"""
+        embeddings = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            
             try:
-                if page_count >= int(max_pages):
-                    logger.info(f"Reached MAX_PAGES={max_pages}. Stopping crawl.")
-                    break
-            except Exception:
-                pass
-
-        if url in visited_pages:
-            logger.info(f"Encountered already visited page {url}. Stopping pagination loop.")
-            break
-        visited_pages.add(url)
-
-        resp = safe_get(url)
-        if not resp:
-            logger.error(f"Failed to fetch {url}. Stopping.")
-            break
-
-        polite_sleep()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # parse page-level PDFs (some pages may link to a brochure)
-        pdf_links = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.lower().endswith(".pdf"):
-                pdf_links.append(urljoin(url, href))
-        # parse HTML records from page
-        page_records = parse_college_cards(soup, url)
-        all_records.extend(page_records)
-
-        # Try to parse PDFs linked directly on the page
-        for pdf_url in set(pdf_links):
-            try:
-                logger.info(f"Downloading PDF brochure: {pdf_url}")
-                pdf_resp = safe_get(pdf_url)
-                if pdf_resp and pdf_resp.content:
-                    # attempt to extract table rows
-                    pdf_recs = []
-                    if pdfplumber:
-                        import io
-                        pdf_recs = extract_from_pdf_bytes(pdf_resp.content, pdf_url)
-                    else:
-                        logger.debug("pdfplumber not installed; skipping pdf contents extraction.")
-                        # still add a record noting pdf existence
-                        pdf_recs = [{
-                            "college": None,
-                            "city": None,
-                            "state": None,
-                            "branch": "Unknown",
-                            "category": "Open",
-                            "closing_rank": None,
-                            "fees": None,
-                            "placement_rating": None,
-                            "naac_rating": None,
-                            "source_url": pdf_url,
-                            "source_type": "pdf",
-                            "retrieved_at": datetime.utcnow().isoformat() + "Z"
-                        }]
-                    all_records.extend(pdf_recs)
-                polite_sleep()
+                response = openai.Embedding.create(
+                    input=batch,
+                    model="text-embedding-ada-002"
+                )
+                
+                batch_embeddings = [item['embedding'] for item in response['data']]
+                embeddings.extend(batch_embeddings)
+                
+                # Rate limiting
+                time.sleep(0.1)
+                
             except Exception as e:
-                logger.exception(f"Error processing PDF {pdf_url}: {e}")
+                self.logger.error(f"OpenAI embedding error: {e}")
+                # Fallback to zeros
+                embeddings.extend([[0.0] * self.embedding_dim] * len(batch))
+        
+        result = np.array(embeddings)
+        
+        # Normalize embeddings
+        norms = np.linalg.norm(result, axis=1, keepdims=True)
+        result = result / (norms + 1e-8)
+        
+        return result
 
-        # find next page via pagination heuristics
-        next_page = find_pagination_next(soup, url)
-        page_count += 1
-        if next_page:
-            parsed = urlparse(next_page)
-            if not parsed.scheme:
-                next_page = urljoin(url, next_page)
-            url = next_page
-            logger.info(f"Next page -> {url}")
-        else:
-            logger.info("No next page found. Finishing crawl.")
-            break
+    def _create_searchable_text(self, record: Dict[str, Any]) -> str:
+        """Convert college record to searchable text representation"""
+        components = []
+        
+        # College name and location
+        if record.get('college'):
+            components.append(record['college'])
+        if record.get('city'):
+            components.append(record['city'])
+        if record.get('state'):
+            components.append(record['state'])
+            
+        # Branch information
+        if record.get('branch') and record['branch'] != 'Not Specified':
+            components.append(record['branch'])
+            
+        # Category
+        if record.get('category'):
+            components.append(f"{record['category']} category")
+            
+        # Ranking information
+        if record.get('closing_rank'):
+            components.append(f"closing rank {record['closing_rank']}")
+            
+        # Additional metadata
+        if record.get('naac_rating'):
+            components.append(f"NAAC {record['naac_rating']}")
+            
+        # Create comprehensive searchable text
+        searchable_text = " ".join(components)
+        
+        # Add common search variations
+        college_name = record.get('college', '').lower()
+        if 'vjti' in college_name:
+            searchable_text += " veermata jijabai technological institute"
+        elif 'iit' in college_name:
+            searchable_text += " indian institute of technology"
+        elif 'nit' in college_name:
+            searchable_text += " national institute of technology"
+        
+        # Add branch variations
+        branch = record.get('branch', '').lower()
+        if 'computer' in branch:
+            searchable_text += " computer science engineering CSE IT information technology"
+        elif 'mechanical' in branch:
+            searchable_text += " mechanical engineering MECH"
+        elif 'electronics' in branch:
+            searchable_text += " electronics communication ECE EXTC"
+        elif 'civil' in branch:
+            searchable_text += " civil engineering CE"
+        elif 'electrical' in branch:
+            searchable_text += " electrical engineering EE"
+            
+        return searchable_text.strip()
 
-    # Postprocess: normalize fields and remove blatantly invalid entries
-    normalized = []
-    seen_keys = set()
-    for r in all_records:
-        college = (r.get("college") or "").strip() if r.get("college") else None
-        branch = (r.get("branch") or "All").strip()
-        category = normalize_category(r.get("category") or "Open")
-        key = (college, branch, category)
-        if not college:
-            logger.debug("Skipping record with missing college name.")
-            continue
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        normalized.append({
-            "college": college,
-            "city": r.get("city"),
-            "state": r.get("state"),
-            "branch": branch,
-            "category": category,
-            "closing_rank": r.get("closing_rank"),
-            "fees": r.get("fees"),
-            "placement_rating": r.get("placement_rating"),
-            "naac_rating": r.get("naac_rating"),
-            "source_url": r.get("source_url"),
-            "source_type": r.get("source_type") or "html",
-            "retrieved_at": r.get("retrieved_at") or datetime.utcnow().isoformat() + "Z"
-        })
-    logger.info(f"Crawl finished. Total normalized records: {len(normalized)}")
-    return normalized
+    def build_index(self, data_path: str, save_index: bool = True) -> Tuple[faiss.Index, Dict[int, Dict]]:
+        """
+        Build FAISS index from college data
+        
+        Args:
+            data_path: Path to JSON data file
+            save_index: Whether to save index to disk
+            
+        Returns:
+            Tuple of (FAISS index, metadata dict)
+        """
+        self.logger.info(f"Building index from {data_path}")
+        
+        # Load data
+        with open(data_path, 'r', encoding='utf-8') as f:
+            records = json.load(f)
+            
+        self.logger.info(f"Loaded {len(records)} records")
+        
+        # Create searchable texts
+        texts = []
+        metadata = {}
+        
+        for idx, record in enumerate(records):
+            searchable_text = self._create_searchable_text(record)
+            texts.append(searchable_text)
+            metadata[idx] = record
+            
+        # Generate embeddings
+        self.logger.info("Generating embeddings...")
+        embeddings = self.embed_texts(texts)
+        
+        # Build FAISS index
+        self.logger.info("Building FAISS index...")
+        index = faiss.IndexFlatIP(self.embedding_dim)  # Inner product for cosine similarity
+        index.add(embeddings.astype(np.float32))
+        
+        self.index = index
+        self.metadata = metadata
+        
+        # Save if requested
+        if save_index:
+            self.save_index()
+            
+        self.logger.info(f"Index built successfully with {index.ntotal} vectors")
+        return index, metadata
 
-# ---- Save outputs ----
+    def save_index(self):
+        """Save FAISS index and metadata to disk"""
+        if self.index is None:
+            raise ValueError("No index to save")
+            
+        # Save FAISS index
+        faiss.write_index(self.index, self.index_path)
+        
+        # Save metadata
+        with open(self.metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(self.metadata, f, indent=2, ensure_ascii=False)
+            
+        self.logger.info(f"Index saved to {self.index_path}, metadata to {self.metadata_path}")
 
-def save_json(records: List[Dict[str, Any]], path: pathlib.Path):
-    logger.info(f"Writing {len(records)} records to JSON: {path}")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+    def load_index(self) -> bool:
+        """
+        Load FAISS index and metadata from disk
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Load FAISS index
+            if not os.path.exists(self.index_path):
+                self.logger.error(f"Index file not found: {self.index_path}")
+                return False
+                
+            self.index = faiss.read_index(self.index_path)
+            
+            # Load metadata
+            if not os.path.exists(self.metadata_path):
+                self.logger.error(f"Metadata file not found: {self.metadata_path}")
+                return False
+                
+            with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                # Convert string keys back to integers
+                metadata_raw = json.load(f)
+                self.metadata = {int(k): v for k, v in metadata_raw.items()}
+                
+            self.logger.info(f"Index loaded successfully with {self.index.ntotal} vectors")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error loading index: {e}")
+            return False
 
-def save_parquet(records: List[Dict[str, Any]], path: pathlib.Path):
-    if not PANDAS_AVAILABLE:
-        logger.warning("Pandas not available; skipping parquet output.")
-        return
-    try:
-        df = pd.DataFrame(records)
-        df.to_parquet(path, index=False)
-        logger.info(f"Wrote parquet to {path}")
-    except Exception as e:
-        logger.exception(f"Failed to write parquet: {e}")
+    def retrieve_relevant_colleges(self, 
+                                 query: str, 
+                                 top_k: int = 5, 
+                                 score_threshold: float = 0.2) -> List[RetrievalResult]:
+        """
+        Retrieve most relevant colleges for query
+        
+        Args:
+            query: Search query string
+            top_k: Number of results to return
+            score_threshold: Minimum similarity score
+            
+        Returns:
+            List of RetrievalResult objects
+        """
+        if self.index is None:
+            if not self.load_index():
+                raise ValueError("No index available")
+        
+        # Generate query embedding
+        query_embedding = self.embed_texts([query])
+        
+        # Search index
+        scores, indices = self.index.search(query_embedding.astype(np.float32), top_k)
+        
+        # Format results
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if score >= score_threshold and idx in self.metadata:
+                record = self.metadata[idx]
+                result = RetrievalResult(
+                    record_id=idx,
+                    score=float(score),
+                    college=record.get('college', 'Unknown'),
+                    branch=record.get('branch', 'Unknown'),
+                    category=record.get('category', 'Open'),
+                    closing_rank=record.get('closing_rank'),
+                    city=record.get('city', 'Unknown'),
+                    source_url=record.get('source_url', ''),
+                    full_record=record
+                )
+                results.append(result)
+                
+        return results
 
-# ---- Command-line entrypoint ----
+    def evaluate_retrieval(self, test_queries_path: str) -> Dict[str, float]:
+        """
+        Evaluate retrieval performance using test queries
+        
+        Args:
+            test_queries_path: Path to JSON file with test queries and expected results
+            
+        Returns:
+            Dictionary with precision, recall, F1 scores
+        """
+        if not os.path.exists(test_queries_path):
+            self.logger.error(f"Test queries file not found: {test_queries_path}")
+            return {}
+            
+        with open(test_queries_path, 'r', encoding='utf-8') as f:
+            test_data = json.load(f)
+            
+        if 'queries' not in test_data:
+            self.logger.error("Test data must contain 'queries' key")
+            return {}
+            
+        all_precisions = []
+        all_recalls = []
+        all_f1s = []
+        
+        for test_case in test_data['queries']:
+            query = test_case['query']
+            expected_colleges = set(test_case.get('expected_colleges', []))
+            
+            # Retrieve results
+            results = self.retrieve_relevant_colleges(query, top_k=10)
+            retrieved_colleges = set(result.college.lower() for result in results)
+            expected_colleges_lower = set(college.lower() for college in expected_colleges)
+            
+            # Calculate metrics
+            if expected_colleges_lower:
+                tp = len(retrieved_colleges.intersection(expected_colleges_lower))
+                fp = len(retrieved_colleges - expected_colleges_lower)
+                fn = len(expected_colleges_lower - retrieved_colleges)
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                
+                all_precisions.append(precision)
+                all_recalls.append(recall)
+                all_f1s.append(f1)
+                
+                self.logger.info(f"Query: '{query}' | P: {precision:.3f} | R: {recall:.3f} | F1: {f1:.3f}")
+        
+        # Calculate averages
+        avg_precision = np.mean(all_precisions) if all_precisions else 0.0
+        avg_recall = np.mean(all_recalls) if all_recalls else 0.0
+        avg_f1 = np.mean(all_f1s) if all_f1s else 0.0
+        
+        metrics = {
+            'precision': avg_precision,
+            'recall': avg_recall,
+            'f1': avg_f1,
+            'num_queries': len(all_f1s)
+        }
+        
+        self.logger.info(f"Overall Metrics - P: {avg_precision:.3f} | R: {avg_recall:.3f} | F1: {avg_f1:.3f}")
+        
+        return metrics
+
+    def get_similar_colleges(self, college_name: str, top_k: int = 5) -> List[RetrievalResult]:
+        """Find colleges similar to a given college"""
+        query = f"{college_name} similar colleges"
+        return self.retrieve_relevant_colleges(query, top_k=top_k)
+
+    def search_by_criteria(self, 
+                          branch: Optional[str] = None,
+                          city: Optional[str] = None,
+                          max_rank: Optional[int] = None,
+                          category: Optional[str] = None,
+                          top_k: int = 10) -> List[RetrievalResult]:
+        """Search colleges by specific criteria"""
+        query_parts = []
+        
+        if branch:
+            query_parts.append(branch)
+        if city:
+            query_parts.append(city)
+        if category:
+            query_parts.append(f"{category} category")
+        if max_rank:
+            query_parts.append(f"rank under {max_rank}")
+            
+        query = " ".join(query_parts)
+        results = self.retrieve_relevant_colleges(query, top_k=top_k * 2)  # Get more initially
+        
+        # Apply hard filters
+        filtered_results = []
+        for result in results:
+            if max_rank and result.closing_rank and result.closing_rank > max_rank:
+                continue
+            if category and result.category.lower() != category.lower():
+                continue
+            if len(filtered_results) >= top_k:
+                break
+            filtered_results.append(result)
+            
+        return filtered_results
+
+
+def create_sample_test_queries() -> Dict[str, Any]:
+    """Create sample test queries for evaluation"""
+    return {
+        "queries": [
+            {
+                "query": "vjti mumbai computer science",
+                "expected_colleges": ["Veermata Jijabai Technological Institute", "VJTI"]
+            },
+            {
+                "query": "best engineering colleges mumbai",
+                "expected_colleges": ["IIT Bombay", "VJTI", "COEP"]
+            },
+            {
+                "query": "mechanical engineering pune",
+                "expected_colleges": ["COEP", "VIT Pune"]
+            },
+            {
+                "query": "computer science low cutoff",
+                "expected_colleges": ["Generic Engineering College"]
+            }
+        ]
+    }
+
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="MHT-CET cutoff scraper (Shiksha predictor)")
-    parser.add_argument("--start-url", default=BASE_URL, help="Start URL (default shiksha predictor)")
-    parser.add_argument("--max-pages", default=MAX_PAGES, help="Optional max pages to crawl (int)")
-    parser.add_argument("--out-json", default=str(OUTPUT_DIR / "mht_cet_data.json"), help="Output JSON path")
-    parser.add_argument("--out-parquet", default=str(OUTPUT_DIR / "mht_cet_data.parquet"), help="Output parquet path")
-    parser.add_argument("--no-parquet", action="store_true", help="Do not try to write parquet even if pandas present")
+    """CLI interface for vector store operations"""
+    parser = argparse.ArgumentParser(description="MHT-CET Vector Store Operations")
+    parser.add_argument("--build", action="store_true", help="Build new index")
+    parser.add_argument("--data", default="mht_cet_data.json", help="Data file path")
+    parser.add_argument("--test", type=str, help="Test query for retrieval")
+    parser.add_argument("--evaluate", type=str, help="Path to test queries file")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of results to return")
+    
     args = parser.parse_args()
+    
+    # Initialize vector store with environment variables
+    embeddings_mode = os.getenv("EMBEDDINGS_MODE", "local")
+    embeddings_model = os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2")
+    index_path = os.getenv("VECTOR_INDEX_PATH", "index.faiss")
+    metadata_path = os.getenv("VECTOR_METADATA_PATH", "metadata.json")
+    
+    vector_store = VectorStore(
+        embeddings_mode=embeddings_mode,
+        embeddings_model=embeddings_model,
+        index_path=index_path,
+        metadata_path=metadata_path
+    )
+    
+    if args.build:
+        print(f"Building index from {args.data}...")
+        vector_store.build_index(args.data)
+        print("Index built successfully!")
+        
+    if args.test:
+        print(f"Testing retrieval for: '{args.test}'")
+        results = vector_store.retrieve_relevant_colleges(args.test, top_k=args.top_k)
+        
+        for i, result in enumerate(results, 1):
+            print(f"\n{i}. {result.college}")
+            print(f"   Branch: {result.branch}")
+            print(f"   City: {result.city}")
+            print(f"   Category: {result.category}")
+            if result.closing_rank:
+                print(f"   Closing Rank: {result.closing_rank}")
+            print(f"   Score: {result.score:.3f}")
+            
+    if args.evaluate:
+        print(f"Evaluating retrieval performance...")
+        if not os.path.exists(args.evaluate):
+            print("Creating sample test queries file...")
+            sample_queries = create_sample_test_queries()
+            with open(args.evaluate, 'w') as f:
+                json.dump(sample_queries, f, indent=2)
+            print(f"Sample test queries saved to {args.evaluate}")
+            
+        metrics = vector_store.evaluate_retrieval(args.evaluate)
+        print(f"\nRetrieval Performance:")
+        print(f"Precision: {metrics.get('precision', 0):.3f}")
+        print(f"Recall: {metrics.get('recall', 0):.3f}")
+        print(f"F1 Score: {metrics.get('f1', 0):.3f}")
 
-    mp = None
-    if args.max_pages:
-        try:
-            mp = int(args.max_pages)
-        except Exception:
-            mp = None
-
-    records = crawl_predictor(start_url=args.start_url, max_pages=mp)
-    save_json(records, pathlib.Path(args.out_json))
-    if not args.no_parquet:
-        save_parquet(records, pathlib.Path(args.out_parquet))
-    logger.info("Done.")
 
 if __name__ == "__main__":
     main()
