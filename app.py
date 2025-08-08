@@ -1,26 +1,53 @@
 #!/usr/bin/env python3
 """
-CET-Mentor v2.0 Flask Application
-AI-powered MHT-CET college recommendation system with RAG and streaming responses
+CET-Mentor v2.0 Flask Backend
+
+Purpose: Production-grade Flask API with RAG-powered MHT-CET assistance
+Implements double approval workflow: RAG retrieval → LLM validation → streaming response
+Supports Claude 3.5 Sonnet, GPT-4, and other OpenRouter models with SSE streaming
+
+Usage:
+    python app.py
+
+Environment Variables (see .env.example):
+    FLASK_SECRET_KEY=your_secret_key
+    OPENROUTER_API_KEY=your_openrouter_key
+    OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+    EMBEDDINGS_MODE=local|openai
+    EMBEDDINGS_MODEL=all-MiniLM-L6-v2
+    VECTOR_INDEX_PATH=index.faiss
+    VECTOR_METADATA_PATH=metadata.json
+    LLM_MODEL=anthropic/claude-3.5-sonnet
+    ADMIN_SECRET=your_admin_secret
+    RATE_LIMIT_PER_MINUTE=60
+
+Endpoints:
+    GET  /                 - Render chat interface
+    POST /suggest         - College suggestions by rank/criteria
+    POST /chat            - RAG-powered chat with streaming
+    POST /feedback        - Submit user feedback
+    POST /admin/reindex   - Rebuild vector index (admin)
+    GET  /admin/logs      - View chat logs (admin)
 """
 
-import os
-import json
 import csv
+import json
 import logging
-from datetime import datetime
-from typing import List, Dict, Optional, Generator, Any
+import os
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Generator
 import uuid
+import re
 
-from flask import Flask, request, jsonify, render_template, session, Response, stream_template
-from flask_session import Session
-from flask_cors import CORS
+from flask import Flask, render_template, request, jsonify, Response, session, stream_template
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import requests
 from dotenv import load_dotenv
 
-# Import our custom modules
-from vector_store import CollegeVectorStore, retrieve_relevant_colleges
-import pandas as pd
+from vector_store import VectorStore, RetrievalResult
 
 # Load environment variables
 load_dotenv()
@@ -30,7 +57,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('cet_mentor.log'),
+        logging.FileHandler('app.log'),
         logging.StreamHandler()
     ]
 )
@@ -38,395 +65,315 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'cet-mentor-secret-key-2024')
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['SESSION_PERMANENT'] = False
-app.config['SESSION_USE_SIGNER'] = True
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-change-in-production')
 
-# Initialize extensions
-Session(app)
-CORS(app, supports_credentials=True)
+# Initialize rate limiter
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["200 per hour"]
+)
 
-class CETMentorAI:
-    """Main AI pipeline for CET-Mentor application"""
+# Global variables
+vector_store = None
+chat_logs = []
+feedback_logs = []
+rate_limit_store = defaultdict(list)
+
+# Configuration
+CONFIG = {
+    'OPENROUTER_API_KEY': os.getenv('OPENROUTER_API_KEY'),
+    'OPENROUTER_BASE_URL': os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1'),
+    'LLM_MODEL': os.getenv('LLM_MODEL', 'anthropic/claude-3.5-sonnet'),
+    'FALLBACK_MODEL': os.getenv('FALLBACK_MODEL', 'openai/gpt-4o'),
+    'EMBEDDINGS_MODE': os.getenv('EMBEDDINGS_MODE', 'local'),
+    'EMBEDDINGS_MODEL': os.getenv('EMBEDDINGS_MODEL', 'all-MiniLM-L6-v2'),
+    'VECTOR_INDEX_PATH': os.getenv('VECTOR_INDEX_PATH', 'index.faiss'),
+    'VECTOR_METADATA_PATH': os.getenv('VECTOR_METADATA_PATH', 'metadata.json'),
+    'ADMIN_SECRET': os.getenv('ADMIN_SECRET', 'admin-secret-change-me'),
+    'RAG_SCORE_THRESHOLD': float(os.getenv('RAG_SCORE_THRESHOLD', '0.3')),
+    'RAG_MIN_RESULTS': int(os.getenv('RAG_MIN_RESULTS', '2')),
+    'RATE_LIMIT_PER_MINUTE': int(os.getenv('RATE_LIMIT_PER_MINUTE', '60'))
+}
+
+# System prompt for LLM with strict RAG validation instructions
+SYSTEM_PROMPT = """You are CET-Mentor, an expert assistant for MHT-CET college admissions in Maharashtra, India. 
+
+CRITICAL INSTRUCTIONS:
+1. You MUST ONLY use information provided in the VERIFIED CONTEXT section for specific college data, cutoffs, and rankings
+2. If VERIFIED CONTEXT is provided, cite specific records by mentioning college names and source evidence
+3. If no VERIFIED CONTEXT is available or insufficient, clearly state "I don't have official cutoff data for this specific query" and provide general guidance
+4. NEVER hallucinate or guess specific cutoff numbers, college rankings, or admission details
+5. When discussing rankings, remember: LOWER rank number = BETTER performance (e.g., rank 1000 is better than rank 5000)
+6. Always be helpful while being transparent about data limitations
+
+RESPONSE STRUCTURE:
+- If using VERIFIED CONTEXT: Start with specific college information from the context
+- If no VERIFIED CONTEXT: Begin with disclaimer about lacking specific data
+- Provide helpful general guidance about MHT-CET admissions process
+- Be encouraging and supportive to students
+
+You can discuss general MHT-CET information, admission processes, study tips, and career guidance even without VERIFIED CONTEXT."""
+
+def initialize_vector_store():
+    """Initialize vector store with error handling"""
+    global vector_store
+    try:
+        vector_store = VectorStore(
+            embeddings_mode=CONFIG['EMBEDDINGS_MODE'],
+            embeddings_model=CONFIG['EMBEDDINGS_MODEL'],
+            index_path=CONFIG['VECTOR_INDEX_PATH'],
+            metadata_path=CONFIG['VECTOR_METADATA_PATH']
+        )
+        
+        if not vector_store.load_index():
+            logger.warning("Could not load vector index - RAG functionality limited")
+            return False
+        
+        logger.info("Vector store initialized successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize vector store: {e}")
+        vector_store = None
+        return False
+
+def check_rate_limit(identifier: str, limit_per_minute: int = None) -> bool:
+    """Simple in-memory rate limiting"""
+    if limit_per_minute is None:
+        limit_per_minute = CONFIG['RATE_LIMIT_PER_MINUTE']
+        
+    current_time = time.time()
+    minute_ago = current_time - 60
     
-    def __init__(self):
-        self.college_data = []
-        self.vector_store = None
-        self.openrouter_api_key = os.getenv('OPENROUTER_API_KEY')
-        self.openrouter_base_url = "https://openrouter.ai/api/v1"
-        self.default_model = "anthropic/claude-3.5-sonnet"
-        self.fallback_model = "openai/gpt-4-turbo"
-        
-        # System prompts
-        self.rag_system_prompt = """You are CET-Mentor, an expert MHT-CET counseling assistant. 
-
-IMPORTANT GUIDELINES:
-- Use VERIFIED CONTEXT from the knowledge base when available
-- If no relevant context is found, use your general knowledge about MHT-CET and Maharashtra engineering colleges
-- RANK is the PRIMARY metric - LOWER rank is BETTER (Rank 1 is best, Rank 50000 is poor)
-- Always provide clear, honest, and actionable advice
-- Consider category-wise reservations (Open, OBC, SC, ST, EWS)
-- Factor in college reputation, location, fees, and placement records
-- Be encouraging but realistic about admission chances
-
-CONTEXT HANDLING:
-- If verified context is provided, prioritize it over general knowledge
-- Cross-reference context data for accuracy
-- Explain rank requirements clearly
-- Mention both safe and ambitious options when relevant"""
-
-        self.conversational_prompt = """You are CET-Mentor, a friendly and knowledgeable MHT-CET counseling expert.
-
-You help students with:
-- College selection based on MHT-CET ranks
-- Branch/course guidance
-- Category-wise admission criteria
-- Fee structure and scholarship information
-- Career guidance and placement insights
-- General MHT-CET process questions
-
-RANK UNDERSTANDING:
-- Lower rank = Better performance (Rank 1 is the best possible)
-- Closing ranks indicate the last student admitted to that branch/category
-- Students need ranks EQUAL TO OR BETTER (lower) than closing rank for admission
-
-Provide helpful, accurate, and encouraging advice while being realistic about admission possibilities."""
-        
-        self.load_college_data()
-        self.initialize_vector_store()
-        
-    def load_college_data(self):
-        """Load college data from JSON file"""
-        try:
-            data_file = 'mht_cet_data.json'
-            if os.path.exists(data_file):
-                with open(data_file, 'r', encoding='utf-8') as f:
-                    self.college_data = json.load(f)
-                logger.info(f"Loaded {len(self.college_data)} college records")
-            else:
-                logger.warning(f"College data file {data_file} not found")
-                self.college_data = []
-        except Exception as e:
-            logger.error(f"Error loading college data: {e}")
-            self.college_data = []
+    # Clean old entries
+    rate_limit_store[identifier] = [
+        timestamp for timestamp in rate_limit_store[identifier] 
+        if timestamp > minute_ago
+    ]
     
-    def initialize_vector_store(self):
-        """Initialize vector store for RAG"""
-        try:
-            self.vector_store = CollegeVectorStore()
-            if not self.vector_store.load_vector_store():
-                if self.college_data:
-                    logger.info("Building new vector store...")
-                    self.vector_store.build_from_data('mht_cet_data.json')
-                else:
-                    logger.warning("No college data available for vector store")
-                    self.vector_store = None
-            else:
-                logger.info("Vector store loaded successfully")
-        except Exception as e:
-            logger.error(f"Error initializing vector store: {e}")
-            self.vector_store = None
+    # Check limit
+    if len(rate_limit_store[identifier]) >= limit_per_minute:
+        return False
+        
+    # Add current request
+    rate_limit_store[identifier].append(current_time)
+    return True
+
+def log_chat_interaction(session_id: str, query: str, response: str, 
+                        retrieval_ids: List[int], llm_decision: Dict[str, Any]):
+    """Log chat interaction for monitoring and improvement"""
+    log_entry = {
+        'timestamp': datetime.now().isoformat(),
+        'session_id': session_id,
+        'query': query,
+        'response_length': len(response),
+        'retrieval_ids': retrieval_ids,
+        'llm_decision': llm_decision,
+        'has_verified_context': len(retrieval_ids) > 0
+    }
     
-    def get_rank_based_suggestions(self, 
-                                 user_rank: int, 
-                                 category: str = "Open",
-                                 branch_filter: str = None,
-                                 city_filter: str = None) -> Dict[str, List[Dict]]:
-        """
-        Get rank-based college suggestions
+    chat_logs.append(log_entry)
+    
+    # Keep only last 1000 entries in memory
+    if len(chat_logs) > 1000:
+        chat_logs.pop(0)
+
+def create_verified_context_block(results: List[RetrievalResult]) -> str:
+    """Create VERIFIED CONTEXT block from retrieval results"""
+    if not results:
+        return ""
+    
+    context_lines = ["=== VERIFIED CONTEXT (Official MHT-CET Data) ==="]
+    
+    for i, result in enumerate(results, 1):
+        context_lines.append(f"\nRecord {i}:")
+        context_lines.append(f"College: {result.college}")
+        context_lines.append(f"Branch: {result.branch}")
+        context_lines.append(f"City: {result.city}")
+        context_lines.append(f"Category: {result.category}")
         
-        Args:
-            user_rank: User's MHT-CET rank
-            category: Admission category
-            branch_filter: Optional branch filter
-            city_filter: Optional city filter
-            
-        Returns:
-            Dictionary with safe_options and ambitious_options
-        """
-        safe_options = []
-        ambitious_options = []
+        if result.closing_rank:
+            context_lines.append(f"Closing Rank: {result.closing_rank}")
         
-        try:
-            # Filter data based on category
-            filtered_data = [
-                college for college in self.college_data 
-                if college.get('category', 'Open') == category
-            ]
-            
-            # Apply additional filters if specified
-            if branch_filter:
-                filtered_data = [
-                    college for college in filtered_data
-                    if branch_filter.lower() in college.get('branch', '').lower()
-                ]
-            
-            if city_filter:
-                filtered_data = [
-                    college for college in filtered_data
-                    if city_filter.lower() in college.get('city', '').lower()
-                ]
-            
-            for college in filtered_data:
-                closing_rank = college.get('closing_rank', 0)
-                
-                if not closing_rank:
-                    continue
-                
-                # Safe options: User rank is better (lower) than closing rank
-                # Add buffer of 10% for safety
-                safe_threshold = closing_rank * 0.9
-                if user_rank <= safe_threshold:
-                    safe_options.append({
-                        'college': college.get('college', ''),
-                        'branch': college.get('branch', ''),
-                        'category': college.get('category', ''),
-                        'closing_rank': closing_rank,
-                        'user_rank': user_rank,
-                        'safety_margin': closing_rank - user_rank,
-                        'fees': college.get('fees', ''),
-                        'city': college.get('city', ''),
-                        'naac_rating': college.get('naac_rating', ''),
-                        'admission_probability': 'High'
-                    })
-                
-                # Ambitious options: User rank is slightly worse than closing rank
-                # Within 20% margin for ambitious attempts
-                ambitious_threshold = closing_rank * 1.2
-                if closing_rank < user_rank <= ambitious_threshold:
-                    rank_gap = user_rank - closing_rank
-                    probability = max(10, 60 - (rank_gap / closing_rank * 100))
-                    
-                    ambitious_options.append({
-                        'college': college.get('college', ''),
-                        'branch': college.get('branch', ''),
-                        'category': college.get('category', ''),
-                        'closing_rank': closing_rank,
-                        'user_rank': user_rank,
-                        'rank_gap': rank_gap,
-                        'fees': college.get('fees', ''),
-                        'city': college.get('city', ''),
-                        'naac_rating': college.get('naac_rating', ''),
-                        'admission_probability': f'{probability:.0f}%'
-                    })
-            
-            # Sort by safety margin for safe options
-            safe_options.sort(key=lambda x: x.get('safety_margin', 0), reverse=True)
-            
-            # Sort by rank gap for ambitious options
-            ambitious_options.sort(key=lambda x: x.get('rank_gap', float('inf')))
-            
-            # Limit results
-            safe_options = safe_options[:15]
-            ambitious_options = ambitious_options[:10]
-            
-            logger.info(f"Generated {len(safe_options)} safe and {len(ambitious_options)} ambitious options for rank {user_rank}")
-            
-        except Exception as e:
-            logger.error(f"Error generating rank-based suggestions: {e}")
+        if result.full_record.get('fees'):
+            context_lines.append(f"Fees: {result.full_record['fees']}")
         
+        if result.full_record.get('naac_rating'):
+            context_lines.append(f"NAAC Rating: {result.full_record['naac_rating']}")
+        
+        context_lines.append(f"Source: {result.source_url}")
+        context_lines.append(f"Relevance Score: {result.score:.3f}")
+    
+    context_lines.append("\n=== END VERIFIED CONTEXT ===\n")
+    return "\n".join(context_lines)
+
+def call_llm_api(messages: List[Dict], model: str = None, stream: bool = True) -> requests.Response:
+    """Call LLM API with proper error handling and fallback"""
+    if not CONFIG['OPENROUTER_API_KEY']:
+        raise ValueError("OPENROUTER_API_KEY not configured")
+    
+    if model is None:
+        model = CONFIG['LLM_MODEL']
+    
+    headers = {
+        'Authorization': f"Bearer {CONFIG['OPENROUTER_API_KEY']}",
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://localhost:5000',
+        'X-Title': 'CET-Mentor v2.0'
+    }
+    
+    payload = {
+        'model': model,
+        'messages': messages,
+        'stream': stream,
+        'max_tokens': 1500,
+        'temperature': 0.7
+    }
+    
+    try:
+        response = requests.post(
+            f"{CONFIG['OPENROUTER_BASE_URL']}/chat/completions",
+            json=payload,
+            headers=headers,
+            stream=stream,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"LLM API error with {model}: {e}")
+        
+        # Try fallback model if primary fails
+        if model != CONFIG['FALLBACK_MODEL']:
+            logger.info(f"Trying fallback model: {CONFIG['FALLBACK_MODEL']}")
+            return call_llm_api(messages, model=CONFIG['FALLBACK_MODEL'], stream=stream)
+        
+        raise
+
+def stream_llm_response(messages: List[Dict]) -> Generator[str, None, None]:
+    """Stream LLM response with proper error handling"""
+    try:
+        response = call_llm_api(messages, stream=True)
+        
+        for line in response.iter_lines():
+            if line:
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    try:
+                        data = line[6:]  # Remove 'data: ' prefix
+                        if data == '[DONE]':
+                            break
+                            
+                        json_data = json.loads(data)
+                        
+                        # Extract content from different response formats
+                        delta = json_data.get('choices', [{}])[0].get('delta', {})
+                        content = delta.get('content', '')
+                        
+                        if content:
+                            yield content
+                            
+                    except json.JSONDecodeError:
+                        continue
+                        
+    except Exception as e:
+        logger.error(f"Streaming error: {e}")
+        yield f"\n\n[Error: Could not complete response - {str(e)}]"
+
+def detect_query_intent(query: str) -> Dict[str, Any]:
+    """Detect user query intent and extract structured data"""
+    query_lower = query.lower().strip()
+    
+    # Pure rank query pattern
+    rank_pattern = r'^\s*(\d{1,7})\s*$'
+    rank_match = re.match(rank_pattern, query_lower)
+    
+    if rank_match:
         return {
-            'safe_options': safe_options,
-            'ambitious_options': ambitious_options
+            'type': 'rank_suggestion',
+            'rank': int(rank_match.group(1)),
+            'category': 'open',
+            'branch': None,
+            'city': None
         }
     
-    def retrieve_context(self, query: str, top_k: int = 5) -> List[Dict]:
-        """Retrieve relevant context using vector store"""
-        if not self.vector_store:
-            logger.warning("Vector store not available")
-            return []
-        
-        try:
-            results = self.vector_store.retrieve_relevant_colleges(
-                query, 
-                top_k=top_k,
-                min_similarity=0.3
-            )
-            
-            # Filter high-quality results
-            quality_results = [
-                result for result in results 
-                if result.get('similarity_score', 0) > 0.4
-            ]
-            
-            logger.info(f"Retrieved {len(quality_results)} quality context results for: {query}")
-            return quality_results
-            
-        except Exception as e:
-            logger.error(f"Error retrieving context: {e}")
-            return []
+    # Rank with additional context
+    rank_context_patterns = [
+        r'(\d{4,7})\s*rank.*?(obc|sc|st|open|general)',
+        r'(obc|sc|st|open|general).*?(\d{4,7})\s*rank',
+        r'rank\s*(\d{4,7}).*?(computer|mechanical|civil|electronics|electrical|it)',
+        r'(\d{4,7}).*?(mumbai|pune|nagpur|nashik|aurangabad)',
+    ]
     
-    def format_context_for_llm(self, context_results: List[Dict]) -> str:
-        """Format retrieved context for LLM"""
-        if not context_results:
-            return ""
-        
-        context_text = "VERIFIED CONTEXT FROM KNOWLEDGE BASE:\n\n"
-        
-        for i, result in enumerate(context_results, 1):
-            context_text += f"Option {i}:\n"
-            context_text += f"College: {result.get('college', 'N/A')}\n"
-            context_text += f"Branch: {result.get('branch', 'N/A')}\n"
-            context_text += f"Category: {result.get('category', 'N/A')}\n"
-            context_text += f"Closing Rank: {result.get('closing_rank', 'N/A')}\n"
-            context_text += f"City: {result.get('city', 'N/A')}\n"
-            context_text += f"Fees: {result.get('fees', 'N/A')}\n"
-            context_text += f"NAAC Rating: {result.get('naac_rating', 'N/A')}\n"
-            context_text += f"Relevance Score: {result.get('similarity_score', 0):.3f}\n\n"
-        
-        context_text += "Use this verified data to provide accurate recommendations.\n"
-        context_text += "Remember: Lower rank numbers are better (Rank 1 is best).\n\n"
-        
-        return context_text
+    extracted_data = {
+        'type': 'general_chat',
+        'rank': None,
+        'category': None,
+        'branch': None,
+        'city': None
+    }
     
-    def call_llm_api(self, 
-                     messages: List[Dict], 
-                     model: str = None, 
-                     stream: bool = True) -> Generator[str, None, None]:
-        """Call LLM API with streaming support"""
-        if not self.openrouter_api_key:
-            yield "Error: OpenRouter API key not configured"
-            return
-        
-        if not model:
-            model = self.default_model
-        
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://cet-mentor.com",
-            "X-Title": "CET-Mentor v2.0"
-        }
-        
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-            "temperature": 0.7,
-            "max_tokens": 2000,
-            "top_p": 0.9
-        }
-        
-        try:
-            response = requests.post(
-                f"{self.openrouter_base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                stream=stream,
-                timeout=30
-            )
-            
-            if not response.ok:
-                logger.error(f"LLM API error: {response.status_code} - {response.text}")
-                yield f"Error: Failed to get response from AI model"
-                return
-            
-            if stream:
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode('utf-8')
-                        if line.startswith('data: '):
-                            data = line[6:]
-                            if data == '[DONE]':
-                                break
-                            try:
-                                json_data = json.loads(data)
-                                if 'choices' in json_data and json_data['choices']:
-                                    delta = json_data['choices'][0].get('delta', {})
-                                    content = delta.get('content', '')
-                                    if content:
-                                        yield content
-                            except json.JSONDecodeError:
-                                continue
-            else:
-                json_response = response.json()
-                if 'choices' in json_response and json_response['choices']:
-                    yield json_response['choices'][0]['message']['content']
-        
-        except requests.exceptions.Timeout:
-            logger.error("LLM API timeout")
-            yield "Error: Request timed out. Please try again."
-        except requests.exceptions.RequestException as e:
-            logger.error(f"LLM API request error: {e}")
-            yield "Error: Failed to connect to AI service."
-        except Exception as e:
-            logger.error(f"Unexpected error in LLM call: {e}")
-            yield "Error: An unexpected error occurred."
+    # Extract rank
+    rank_nums = re.findall(r'\b(\d{4,7})\b', query_lower)
+    if rank_nums:
+        extracted_data['rank'] = int(rank_nums[0])
+        extracted_data['type'] = 'rank_suggestion'
     
-    def chat_with_rag(self, user_query: str, chat_history: List[Dict] = None) -> Generator[str, None, None]:
-        """
-        Handle chat with RAG pipeline
-        
-        Args:
-            user_query: User's question
-            chat_history: Previous chat messages
-            
-        Yields:
-            Streaming response chunks
-        """
-        if not chat_history:
-            chat_history = []
-        
-        # Step 1: Try to retrieve relevant context
-        logger.info(f"Processing query: {user_query}")
-        context_results = self.retrieve_context(user_query)
-        
-        # Step 2: Prepare messages for LLM
-        messages = []
-        
-        # Add system prompt
-        if context_results:
-            # RAG mode with context
-            system_prompt = self.rag_system_prompt
-            context_text = self.format_context_for_llm(context_results)
-            messages.append({
-                "role": "system", 
-                "content": f"{system_prompt}\n\n{context_text}"
-            })
-            logger.info(f"Using RAG mode with {len(context_results)} context results")
-        else:
-            # Conversational mode without context
-            messages.append({
-                "role": "system", 
-                "content": self.conversational_prompt
-            })
-            logger.info("Using conversational mode (no relevant context found)")
-        
-        # Add chat history
-        for msg in chat_history[-6:]:  # Keep last 6 messages for context
-            messages.append(msg)
-        
-        # Add current user query
-        messages.append({"role": "user", "content": user_query})
-        
-        # Step 3: Call LLM with streaming
-        try:
-            for chunk in self.call_llm_api(messages, stream=True):
-                yield chunk
-        except Exception as e:
-            logger.error(f"Error in chat processing: {e}")
-            yield "I apologize, but I encountered an error while processing your question. Please try again."
-
-# Initialize AI system
-ai_system = CETMentorAI()
+    # Extract category
+    categories = {
+        'obc': ['obc'],
+        'sc': ['sc'],
+        'st': ['st'],
+        'open': ['open', 'general']
+    }
+    
+    for category, keywords in categories.items():
+        if any(keyword in query_lower for keyword in keywords):
+            extracted_data['category'] = category
+            break
+    
+    # Extract branch
+    branches = {
+        'computer science': ['computer', 'cse', 'cs', 'it', 'information technology'],
+        'mechanical': ['mechanical', 'mech'],
+        'electronics': ['electronics', 'extc', 'ece', 'communication'],
+        'civil': ['civil'],
+        'electrical': ['electrical', 'ee']
+    }
+    
+    for branch, keywords in branches.items():
+        if any(keyword in query_lower for keyword in keywords):
+            extracted_data['branch'] = branch
+            break
+    
+    # Extract city
+    cities = ['mumbai', 'pune', 'nagpur', 'nashik', 'aurangabad', 'kolhapur', 'sangli']
+    for city in cities:
+        if city in query_lower:
+            extracted_data['city'] = city
+            break
+    
+    return extracted_data
 
 @app.route('/')
 def index():
-    """Serve the main frontend"""
+    """Render main chat interface"""
     return render_template('index.html')
 
 @app.route('/suggest', methods=['POST'])
+@limiter.limit("30 per minute")
 def suggest_colleges():
     """
-    Rank-based college suggestion endpoint
+    College suggestion endpoint based on rank and criteria
     
-    Expected JSON input:
+    Expected JSON payload:
     {
-        "rank": 12000,
-        "category": "Open",
-        "branch": "Computer Science",
-        "city": "Mumbai"
+        "rank": 12345,
+        "category": "open|obc|sc|st", 
+        "branch": "computer science",
+        "city": "mumbai"
     }
     """
     try:
@@ -435,57 +382,101 @@ def suggest_colleges():
         if not data or 'rank' not in data:
             return jsonify({'error': 'Rank is required'}), 400
         
-        user_rank = int(data['rank'])
-        category = data.get('category', 'Open')
-        branch_filter = data.get('branch')
-        city_filter = data.get('city')
+        rank = int(data['rank'])
+        category = data.get('category', 'open').lower()
+        branch = data.get('branch', '')
+        city = data.get('city', '')
         
-        # Validate inputs
-        if user_rank <= 0:
-            return jsonify({'error': 'Invalid rank provided'}), 400
+        # Validate rank range
+        if rank < 1 or rank > 200000:
+            return jsonify({'error': 'Rank must be between 1 and 200000'}), 400
         
-        # Get suggestions
-        suggestions = ai_system.get_rank_based_suggestions(
-            user_rank=user_rank,
-            category=category,
-            branch_filter=branch_filter,
-            city_filter=city_filter
-        )
+        # Build search query for vector retrieval
+        query_parts = []
+        if branch:
+            query_parts.append(branch)
+        if city:
+            query_parts.append(city)
+        if category != 'open':
+            query_parts.append(f"{category} category")
         
-        # Prepare response
-        response_data = {
-            'user_rank': user_rank,
-            'category': category,
-            'filters': {
-                'branch': branch_filter,
-                'city': city_filter
-            },
-            'safe_options': suggestions['safe_options'],
-            'ambitious_options': suggestions['ambitious_options'],
-            'total_safe': len(suggestions['safe_options']),
-            'total_ambitious': len(suggestions['ambitious_options']),
-            'timestamp': datetime.now().isoformat()
+        query_parts.append(f"rank {rank}")
+        search_query = " ".join(query_parts)
+        
+        # Retrieve relevant colleges
+        safe_options = []
+        ambitious_options = []
+        
+        if vector_store:
+            try:
+                results = vector_store.retrieve_relevant_colleges(
+                    search_query, 
+                    top_k=20,
+                    score_threshold=0.1
+                )
+                
+                for result in results:
+                    college_data = {
+                        'college': result.college,
+                        'branch': result.branch,
+                        'city': result.city,
+                        'category': result.category,
+                        'closing_rank': result.closing_rank,
+                        'fees': result.full_record.get('fees'),
+                        'naac_rating': result.full_record.get('naac_rating'),
+                        'confidence': result.score
+                    }
+                    
+                    # Categorize based on rank comparison
+                    if result.closing_rank:
+                        if result.closing_rank <= rank + 5000:  # Safe options
+                            safe_options.append(college_data)
+                        elif result.closing_rank <= rank - 2000:  # Ambitious options
+                            ambitious_options.append(college_data)
+                    else:
+                        # Unknown rank - add to safe options
+                        safe_options.append(college_data)
+                
+                # Sort by confidence and limit results
+                safe_options = sorted(safe_options, key=lambda x: x['confidence'], reverse=True)[:10]
+                ambitious_options = sorted(ambitious_options, key=lambda x: x['confidence'], reverse=True)[:10]
+                
+            except Exception as e:
+                logger.error(f"Vector search error: {e}")
+                # Return empty results on error
+                pass
+        
+        # Log suggestion request
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'type': 'suggestion',
+            'query': data,
+            'results_count': len(safe_options) + len(ambitious_options)
         }
+        chat_logs.append(log_entry)
         
-        logger.info(f"Served suggestions for rank {user_rank}, category {category}")
-        return jsonify(response_data)
+        return jsonify({
+            'safe_options': safe_options,
+            'ambitious_options': ambitious_options,
+            'query_info': {
+                'rank': rank,
+                'category': category,
+                'branch': branch,
+                'city': city
+            },
+            'disclaimer': 'Rankings are based on available data and may not reflect current year cutoffs. Always verify with official college websites.'
+        })
         
-    except ValueError as e:
-        return jsonify({'error': 'Invalid rank format'}), 400
     except Exception as e:
-        logger.error(f"Error in suggest endpoint: {e}")
+        logger.error(f"Suggestion error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/chat', methods=['POST'])
+@limiter.limit("20 per minute")
 def chat():
     """
-    RAG-enhanced chat endpoint with streaming
-    
-    Expected JSON input:
-    {
-        "message": "What are good colleges for computer science with rank 5000?",
-        "session_id": "optional-session-id"
-    }
+    RAG-powered chat endpoint with streaming response
+    Implements double approval workflow: RAG → LLM validation → stream
     """
     try:
         data = request.get_json()
@@ -494,45 +485,106 @@ def chat():
             return jsonify({'error': 'Message is required'}), 400
         
         user_message = data['message'].strip()
-        session_id = data.get('session_id', str(uuid.uuid4()))
+        session_id = data.get('session_id') or str(uuid.uuid4())
         
         if not user_message:
             return jsonify({'error': 'Empty message'}), 400
         
-        # Get chat history from session
-        if 'chat_history' not in session:
-            session['chat_history'] = {}
+        # Rate limiting check
+        client_ip = get_remote_address()
+        if not check_rate_limit(f"chat_{client_ip}"):
+            return jsonify({'error': 'Rate limit exceeded'}), 429
         
-        if session_id not in session['chat_history']:
-            session['chat_history'][session_id] = []
+        # Detect query intent
+        intent = detect_query_intent(user_message)
         
-        chat_history = session['chat_history'][session_id]
+        # Step 1: RAG Retrieval
+        verified_context = ""
+        retrieval_ids = []
         
-        # Stream response
+        if vector_store and intent['type'] in ['rank_suggestion', 'general_chat']:
+            try:
+                results = vector_store.retrieve_relevant_colleges(
+                    user_message,
+                    top_k=5,
+                    score_threshold=CONFIG['RAG_SCORE_THRESHOLD']
+                )
+                
+                # Apply additional filtering based on intent
+                if intent.get('rank') and intent['rank'] > 0:
+                    # Filter results relevant to the rank
+                    filtered_results = []
+                    for result in results:
+                        if result.closing_rank:
+                            # Include if rank is within reasonable range
+                            rank_diff = abs(result.closing_rank - intent['rank'])
+                            if rank_diff <= 10000:  # 10k rank difference tolerance
+                                filtered_results.append(result)
+                        else:
+                            # Include if no rank data available
+                            filtered_results.append(result)
+                    results = filtered_results[:3]  # Limit to top 3
+                
+                if len(results) >= CONFIG['RAG_MIN_RESULTS']:
+                    verified_context = create_verified_context_block(results)
+                    retrieval_ids = [result.record_id for result in results]
+                    
+            except Exception as e:
+                logger.error(f"RAG retrieval error: {e}")
+        
+        # Step 2: LLM Decision and Response Generation
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        
+        # Add context if available
+        user_content = user_message
+        if verified_context:
+            user_content = f"{verified_context}\n\nUser Question: {user_message}"
+        
+        messages.append({"role": "user", "content": user_content})
+        
+        # Log LLM decision
+        llm_decision = {
+            'has_context': bool(verified_context),
+            'context_records': len(retrieval_ids),
+            'intent_type': intent['type'],
+            'model_used': CONFIG['LLM_MODEL']
+        }
+        
+        # Step 3: Stream Response
         def generate_response():
             try:
-                response_content = ""
-                for chunk in ai_system.chat_with_rag(user_message, chat_history):
-                    response_content += chunk
-                    yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                full_response = ""
                 
-                # Save to chat history
-                chat_history.append({"role": "user", "content": user_message})
-                chat_history.append({"role": "assistant", "content": response_content})
+                # Send initial metadata
+                yield f"data: {json.dumps({'type': 'metadata', 'session_id': session_id, 'has_context': bool(verified_context)})}\n\n"
                 
-                # Keep only last 10 exchanges
-                if len(chat_history) > 20:
-                    session['chat_history'][session_id] = chat_history[-20:]
+                # Stream LLM response
+                for content_chunk in stream_llm_response(messages):
+                    full_response += content_chunk
+                    yield f"data: {json.dumps({'type': 'delta', 'content': content_chunk})}\n\n"
                 
-                yield f"data: {json.dumps({'done': True, 'session_id': session_id})}\n\n"
+                # Send completion signal
+                yield f"data: {json.dumps({'type': 'done', 'total_length': len(full_response)})}\n\n"
+                
+                # Log complete interaction
+                log_chat_interaction(
+                    session_id=session_id,
+                    query=user_message,
+                    response=full_response,
+                    retrieval_ids=retrieval_ids,
+                    llm_decision=llm_decision
+                )
                 
             except Exception as e:
-                logger.error(f"Error in streaming response: {e}")
-                yield f"data: {json.dumps({'error': 'An error occurred while processing your request'})}\n\n"
+                logger.error(f"Response generation error: {e}")
+                error_msg = "I apologize, but I encountered an error generating the response. Please try again."
+                yield f"data: {json.dumps({'type': 'error', 'content': error_msg})}\n\n"
         
         return Response(
             generate_response(),
-            mimetype='text/event-stream',
+            content_type='text/plain; charset=utf-8',
             headers={
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
@@ -541,141 +593,165 @@ def chat():
         )
         
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}")
+        logger.error(f"Chat error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/feedback', methods=['POST'])
-def feedback():
-    """
-    Log user feedback to CSV
-    
-    Expected JSON input:
-    {
-        "rating": 5,
-        "comment": "Very helpful suggestions",
-        "query": "original user query",
-        "session_id": "session-id"
-    }
-    """
+@limiter.limit("10 per minute")
+def submit_feedback():
+    """Submit user feedback on responses"""
     try:
         data = request.get_json()
         
-        if not data:
-            return jsonify({'error': 'Feedback data is required'}), 400
+        required_fields = ['session_id', 'rating']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Missing required fields'}), 400
         
-        # Prepare feedback record
-        feedback_record = {
+        feedback_entry = {
             'timestamp': datetime.now().isoformat(),
-            'session_id': data.get('session_id', ''),
-            'rating': data.get('rating', ''),
+            'session_id': data['session_id'],
+            'rating': data['rating'],  # 'positive', 'negative'
             'comment': data.get('comment', ''),
-            'query': data.get('query', ''),
-            'user_agent': request.headers.get('User-Agent', ''),
-            'ip_address': request.remote_addr
+            'query_context': data.get('query_context', ''),
+            'client_ip': get_remote_address()
         }
         
-        # Save to CSV
-        feedback_file = 'feedback.csv'
-        file_exists = os.path.exists(feedback_file)
+        # Store in memory and CSV
+        feedback_logs.append(feedback_entry)
         
-        with open(feedback_file, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['timestamp', 'session_id', 'rating', 'comment', 'query', 'user_agent', 'ip_address']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+        # Append to CSV file
+        csv_file = 'feedback.csv'
+        file_exists = os.path.isfile(csv_file)
+        
+        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=feedback_entry.keys())
             if not file_exists:
                 writer.writeheader()
-            
-            writer.writerow(feedback_record)
+            writer.writerow(feedback_entry)
         
-        logger.info(f"Feedback recorded: Rating {feedback_record['rating']}")
-        return jsonify({'message': 'Feedback recorded successfully'})
+        logger.info(f"Feedback received: {data['rating']} for session {data['session_id']}")
+        
+        return jsonify({'status': 'success'})
         
     except Exception as e:
-        logger.error(f"Error recording feedback: {e}")
-        return jsonify({'error': 'Failed to record feedback'}), 500
+        logger.error(f"Feedback error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/admin/reindex', methods=['POST'])
+def admin_reindex():
+    """Admin endpoint to rebuild vector index"""
+    try:
+        # Check admin authorization
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or auth_header != f"Bearer {CONFIG['ADMIN_SECRET']}":
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        data = request.get_json()
+        data_file = data.get('data_file', 'mht_cet_data.json')
+        
+        if not os.path.exists(data_file):
+            return jsonify({'error': f'Data file {data_file} not found'}), 400
+        
+        # Rebuild index
+        global vector_store
+        if vector_store:
+            vector_store.build_index(data_file, save_index=True)
+            logger.info(f"Index rebuilt from {data_file}")
+            
+            return jsonify({
+                'status': 'success',
+                'message': f'Index rebuilt from {data_file}',
+                'timestamp': datetime.now().isoformat()
+            })
+        else:
+            return jsonify({'error': 'Vector store not available'}), 500
+            
+    except Exception as e:
+        logger.error(f"Reindex error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/admin/logs', methods=['GET'])
+def admin_logs():
+    """Admin endpoint to view chat logs"""
+    try:
+        # Check admin authorization
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or auth_header != f"Bearer {CONFIG['ADMIN_SECRET']}":
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        # Get recent logs
+        limit = min(int(request.args.get('limit', 50)), 200)
+        recent_logs = chat_logs[-limit:] if limit > 0 else chat_logs
+        
+        # Get feedback stats
+        feedback_stats = {
+            'total': len(feedback_logs),
+            'positive': len([f for f in feedback_logs if f['rating'] == 'positive']),
+            'negative': len([f for f in feedback_logs if f['rating'] == 'negative'])
+        }
+        
+        return jsonify({
+            'chat_logs': recent_logs,
+            'feedback_stats': feedback_stats,
+            'total_chats': len(chat_logs),
+            'vector_store_status': 'available' if vector_store else 'unavailable'
+        })
+        
+    except Exception as e:
+        logger.error(f"Admin logs error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    try:
-        health_status = {
-            'status': 'healthy',
-            'timestamp': datetime.now().isoformat(),
-            'data_loaded': len(ai_system.college_data) > 0,
-            'vector_store': ai_system.vector_store is not None,
-            'api_configured': ai_system.openrouter_api_key is not None
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'version': '2.0',
+        'services': {
+            'vector_store': 'available' if vector_store else 'unavailable',
+            'llm_api': 'configured' if CONFIG['OPENROUTER_API_KEY'] else 'not_configured'
         }
-        
-        return jsonify(health_status)
-        
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+    })
 
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    """Get system statistics"""
-    try:
-        stats = {
-            'total_colleges': len(set(college.get('college', '') for college in ai_system.college_data)),
-            'total_records': len(ai_system.college_data),
-            'categories': list(set(college.get('category', '') for college in ai_system.college_data)),
-            'cities': list(set(college.get('city', '') for college in ai_system.college_data)),
-            'branches': list(set(college.get('branch', '') for college in ai_system.college_data)),
-            'vector_store_stats': ai_system.vector_store.get_statistics() if ai_system.vector_store else {}
-        }
-        
-        return jsonify(stats)
-        
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
-        return jsonify({'error': 'Failed to get statistics'}), 500
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    """Rate limit error handler"""
+    return jsonify({
+        'error': 'Rate limit exceeded',
+        'message': 'Too many requests. Please wait before trying again.'
+    }), 429
 
 @app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"Internal server error: {error}")
-    return jsonify({'error': 'Internal server error'}), 500
+def internal_error_handler(e):
+    """Internal error handler"""
+    logger.error(f"Internal error: {e}")
+    return jsonify({
+        'error': 'Internal server error',
+        'message': 'Something went wrong. Please try again later.'
+    }), 500
 
-if __name__ == '__main__':
-    # Ensure required directories exist
-    os.makedirs('templates', exist_ok=True)
-    os.makedirs('static', exist_ok=True)
+def main():
+    """Initialize and run Flask application"""
+    # Initialize vector store
+    if not initialize_vector_store():
+        logger.warning("Starting without vector store - limited functionality")
     
-    # Create a simple index.html if it doesn't exist
-    index_html_path = 'templates/index.html'
-    if not os.path.exists(index_html_path):
-        with open(index_html_path, 'w') as f:
-            f.write("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>CET-Mentor v2.0</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
-<body>
-    <h1>CET-Mentor v2.0</h1>
-    <p>AI-powered MHT-CET college recommendation system</p>
-    <p>API endpoints available:</p>
-    <ul>
-        <li><strong>POST /suggest</strong> - Get rank-based college suggestions</li>
-        <li><strong>POST /chat</strong> - Chat with AI counselor</li>
-        <li><strong>POST /feedback</strong> - Submit feedback</li>
-        <li><strong>GET /health</strong> - Health check</li>
-        <li><strong>GET /stats</strong> - System statistics</li>
-    </ul>
-</body>
-</html>
-            """)
+    # Validate configuration
+    if not CONFIG['OPENROUTER_API_KEY']:
+        logger.warning("OPENROUTER_API_KEY not set - LLM functionality disabled")
     
-    # Get configuration from environment
-    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
-    port = int(os.getenv('FLASK_PORT', 5000))
-    host = os.getenv('FLASK_HOST', '0.0.0.0')
+    logger.info("CET-Mentor v2.0 starting...")
+    logger.info(f"Vector store: {'Available' if vector_store else 'Unavailable'}")
+    logger.info(f"LLM model: {CONFIG['LLM_MODEL']}")
+    logger.info(f"Embeddings: {CONFIG['EMBEDDINGS_MODE']} ({CONFIG['EMBEDDINGS_MODEL']})")
     
-    logger.info(f"Starting CET-Mentor v2.0 on {host}:{port}")
-    app.run(debug=debug_mode, host=host, port=port, threaded=True)
+    # Run Flask app
+    app.run(
+        host='0.0.0.0',
+        port=int(os.getenv('PORT', 5000)),
+        debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    )
+
+if __name__ == "__main__":
+    main()
