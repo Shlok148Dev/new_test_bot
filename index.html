@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>CET-Mentor v2.0</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        window.tailwindConfig = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        'poppins': ['Poppins', 'sans-serif'],
+                    },
+                    animation: {
+                        'gradient': 'gradient 6s ease-in-out infinite',
+                        'shimmer': 'shimmer 2s linear infinite',
+                        'typing': 'typing 1.4s infinite ease-in-out',
+                        'fade-in': 'fadeIn 0.5s ease-out',
+                        'slide-in-left': 'slideInLeft 0.3s ease-out',
+                        'blob': 'blob 20s infinite',
+                        'glow': 'glow 2s ease-in-out infinite alternate',
+                    },
+                    keyframes: {
+                        gradient: {
+                            '0%, 100%': { 'background-position': '0% 50%' },
+                            '50%': { 'background-position': '100% 50%' },
+                        },
+                        shimmer: {
+                            '0%': { transform: 'translateX(-100%)' },
+                            '100%': { transform: 'translateX(100%)' },
+                        },
+                        typing: {
+                            '0%, 60%, 100%': { transform: 'scale(0.8)', opacity: '0.5' },
+                            '30%': { transform: 'scale(1.2)', opacity: '1' },
+                        },
+                        fadeIn: {
+                            'from': { opacity: '0', transform: 'translateY(10px)' },
+                            'to': { opacity: '1', transform: 'translateY(0)' },
+                        },
+                        slideInLeft: {
+                            'from': { transform: 'translateX(-100%)' },
+                            'to': { transform: 'translateX(0)' },
+                        },
+                        blob: {
+                            '0%': { transform: 'translate(0px, 0px) scale(1)' },
+                            '33%': { transform: 'translate(30px, -50px) scale(1.1)' },
+                            '66%': { transform: 'translate(-20px, 20px) scale(0.9)' },
+                            '100%': { transform: 'translate(0px, 0px) scale(1)' },
+                        },
+                        glow: {
+                            'from': { boxShadow: '0 0 20px var(--primary-glow)' },
+                            'to': { boxShadow: '0 0 30px var(--primary-glow), 0 0 40px var(--primary-glow)' },
+                        },
+                    },
+                },
+            },
+        };
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {
+            --bg-top: #080612;
+            --bg-bottom: #0F0B24;
+            --primary-gradient: linear-gradient(135deg, #5E4CE6, #D96BF8);
+            --secondary-gradient: linear-gradient(135deg, #3B2A9F, #5E4CE6);
+            --tertiary-gradient: linear-gradient(135deg, #1F1B47, #3B2A9F);
+            --neon-purple: #A855F7;
+            --neon-pink: #EC4899;
+            --glow-cyan: #22D3EE;
+            --primary-glow: rgba(168, 85, 247, 0.4);
+            --glass-bg: rgba(255, 255, 255, 0.08);
+            --glass-border: rgba(255, 255, 255, 0.15);
+        }
+
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(to bottom, var(--bg-top), var(--bg-bottom));
+            min-height: 100vh;
+        }
+
+        .gradient-bg {
+            background: linear-gradient(to bottom, var(--bg-top), var(--bg-bottom));
+            position: relative;
+            overflow: hidden;
+        }
+
+        .gradient-bg::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(94, 76, 230, 0.1) 0%, transparent 50%);
+            animation: blob 20s infinite;
+            z-index: 0;
+        }
+
+        .gradient-bg::after {
+            content: '';
+            position: absolute;
+            bottom: -30%;
+            right: -30%;
+            width: 150%;
+            height: 150%;
+            background: radial-gradient(circle, rgba(217, 107, 248, 0.08) 0%, transparent 50%);
+            animation: blob 25s infinite reverse;
+            z-index: 0;
+        }
+
+        .glass-effect {
+            background: var(--glass-bg);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+        }
+
+        .primary-gradient {
+            background: var(--primary-gradient);
+            background-size: 200% 200%;
+            animation: gradient 6s ease-in-out infinite;
+        }
+
+        .secondary-gradient {
+            background: var(--secondary-gradient);
+            background-size: 200% 200%;
+        }
+
+        .tertiary-gradient {
+            background: var(--tertiary-gradient);
+            background-size: 200% 200%;
+        }
+
+        .gradient-border {
+            background: var(--primary-gradient);
+            padding: 2px;
+            border-radius: 12px;
+        }
+
+        .gradient-border-inner {
+            background: var(--bg-top);
+            border-radius: 10px;
+        }
+
+        .shimmer::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+            transform: translateX(-100%);
+            animation: shimmer 2s infinite;
+        }
+
+        .typing-dots {
+            display: inline-flex;
+            gap: 4px;
+        }
+
+        .typing-dots span {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--neon-purple);
+            animation: typing 1.4s infinite ease-in-out;
+        }
+
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        .verified-context {
+            background: linear-gradient(135deg, rgba(34, 211, 238, 0.1), rgba(34, 211, 238, 0.05));
+            border: 1px solid rgba(34, 211, 238, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .verified-context::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.1), transparent);
+            animation: shimmer 3s infinite;
+        }
+
+        .chat-bubble-user {
+            background: rgba(31, 27, 71, 0.8);
+            border: 1px solid rgba(94, 76, 230, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .chat-bubble-bot {
+            background: var(--secondary-gradient);
+            color: white;
+        }
+
+        .scrollbar-custom::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .scrollbar-custom::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .scrollbar-custom::-webkit-scrollbar-thumb {
+            background: var(--neon-purple);
+            border-radius: 3px;
+            opacity: 0.5;
+        }
+
+        .scrollbar-custom::-webkit-scrollbar-thumb:hover {
+            opacity: 1;
+        }
+
+        .mobile-sidebar {
+            transform: translateX(-100%);
+            transition: transform 0.3s ease-out;
+            z-index: 1000;
+        }
+
+        .mobile-sidebar.open {
+            transform: translateX(0);
+        }
+
+        @media (max-width: 768px) {
+            .mobile-filters {
+                max-height: 0;
+                overflow: hidden;
+                transition: max-height 0.3s ease-out, padding 0.3s ease-out;
+            }
+            
+            .mobile-filters.open {
+                max-height: 200px;
+                padding: 1rem;
+            }
+        }
+
+        .suggestion-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 20px rgba(168, 85, 247, 0.4);
+        }
+
+        .feedback-btn:hover {
+            transform: scale(1.1);
+            filter: brightness(1.3);
+        }
+
+        .avatar-bot {
+            background: var(--primary-gradient);
+            background-size: 200% 200%;
+            animation: gradient 6s ease-in-out infinite;
+        }
+
+        .avatar-user {
+            background: var(--tertiary-gradient);
+        }
+    </style>
+</head>
+<body class="gradient-bg min-h-screen">
+    <!-- Mobile Header -->
+    <header class="md:hidden fixed top-0 left-0 right-0 z-50 glass-effect border-b border-white/10">
+        <div class="flex items-center justify-between p-4">
+            <button id="mobile-sidebar-toggle" class="p-2 rounded-lg hover:bg-white/10 transition-all duration-200" aria-label="Open sidebar">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                </svg>
+            </button>
+            <h1 class="text-lg font-bold text-white">CET-Mentor</h1>
+            <button id="mobile-filters-toggle" class="p-2 rounded-lg hover:bg-white/10 transition-all duration-200" aria-label="Toggle filters">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.707A1 1 0 013 7V4z"></path>
+                </svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Mobile Filters -->
+    <div id="mobile-filters" class="mobile-filters md:hidden fixed top-16 left-0 right-0 z-40 glass-effect border-b border-white/10">
+        <div class="grid grid-cols-1 gap-3">
+            <select id="mobile-category" class="w-full bg-black/30 border border-white/20 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all">
+                <option value="">All Categories</option>
+                <option value="general">General</option>
+                <option value="obc">OBC</option>
+                <option value="sc">SC</option>
+                <option value="st">ST</option>
+                <option value="ews">EWS</option>
+            </select>
+            <select id="mobile-branch" class="w-full bg-black/30 border border-white/20 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all">
+                <option value="">All Branches</option>
+                <option value="computer">Computer Engineering</option>
+                <option value="mechanical">Mechanical Engineering</option>
+                <option value="electronics">Electronics Engineering</option>
+                <option value="civil">Civil Engineering</option>
+                <option value="electrical">Electrical Engineering</option>
+            </select>
+            <select id="mobile-city" class="w-full bg-black/30 border border-white/20 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all">
+                <option value="">All Cities</option>
+                <option value="mumbai">Mumbai</option>
+                <option value="pune">Pune</option>
+                <option value="nashik">Nashik</option>
+                <option value="nagpur">Nagpur</option>
+                <option value="aurangabad">Aurangabad</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="flex h-screen">
+        <!-- Sidebar -->
+        <aside id="sidebar" class="mobile-sidebar md:translate-x-0 fixed md:relative w-80 md:w-72 h-full glass-effect border-r border-white/10 overflow-y-auto scrollbar-custom">
+            <div class="p-6 h-full flex flex-col">
+                <!-- Logo -->
+                <div class="flex items-center mb-8">
+                    <div class="w-12 h-12 rounded-full avatar-bot flex items-center justify-center mr-3 shadow-lg">
+                        <span class="text-white font-bold text-lg">C</span>
+                    </div>
+                    <div>
+                        <h1 class="text-xl font-bold text-white">CET-Mentor</h1>
+                        <p class="text-sm text-gray-300">v2.0</p>
+                    </div>
+                </div>
+
+                <!-- Quick Rank Input -->
+                <div class="mb-6">
+                    <div class="gradient-border">
+                        <div class="gradient-border-inner p-4">
+                            <h3 class="text-sm font-semibold mb-3 text-white">Quick Rank Analysis</h3>
+                            <div class="flex gap-2">
+                                <input 
+                                    type="number" 
+                                    id="rank-input" 
+                                    placeholder="Enter your rank"
+                                    class="flex-1 bg-black/30 border border-white/20 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-400 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
+                                >
+                                <button 
+                                    id="suggest-btn"
+                                    class="px-4 py-2 primary-gradient rounded-lg text-sm font-medium text-white hover:shadow-lg transition-all duration-200 transform hover:scale-105"
+                                >
+                                    Suggest
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Filters -->
+                <div class="mb-6 space-y-4 flex-1">
+                    <h3 class="text-sm font-semibold text-gray-300">Filters</h3>
+                    
+                    <select id="category" class="w-full bg-black/30 border border-white/20 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all">
+                        <option value="">All Categories</option>
+                        <option value="general">General</option>
+                        <option value="obc">OBC</option>
+                        <option value="sc">SC</option>
+                        <option value="st">ST</option>
+                        <option value="ews">EWS</option>
+                    </select>
+
+                    <select id="branch" class="w-full bg-black/30 border border-white/20 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all">
+                        <option value="">All Branches</option>
+                        <option value="computer">Computer Engineering</option>
+                        <option value="mechanical">Mechanical Engineering</option>
+                        <option value="electronics">Electronics Engineering</option>
+                        <option value="civil">Civil Engineering</option>
+                        <option value="electrical">Electrical Engineering</option>
+                    </select>
+
+                    <select id="city" class="w-full bg-black/30 border border-white/20 rounded-lg p-3 text-white focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all">
+                        <option value="">All Cities</option>
+                        <option value="mumbai">Mumbai</option>
+                        <option value="pune">Pune</option>
+                        <option value="nashik">Nashik</option>
+                        <option value="nagpur">Nagpur</option>
+                        <option value="aurangabad">Aurangabad</option>
+                    </select>
+
+                    <!-- Quick Suggestions -->
+                    <div class="space-y-3 mt-6">
+                        <h3 class="text-sm font-semibold text-gray-300">Quick Suggestions</h3>
+                        <div class="space-y-2">
+                            <button class="suggestion-btn w-full text-left p-3 rounded-lg glass-effect border border-white/10 hover:border-purple-500/50 transition-all duration-200 text-sm text-white">
+                                💡 Best colleges for Computer Engineering
+                            </button>
+                            <button class="suggestion-btn w-full text-left p-3 rounded-lg glass-effect border border-white/10 hover:border-purple-500/50 transition-all duration-200 text-sm text-white">
+                                📊 Cutoff trends for top colleges
+                            </button>
+                            <button class="suggestion-btn w-full text-left p-3 rounded-lg glass-effect border border-white/10 hover:border-purple-500/50 transition-all duration-200 text-sm text-white">
+                                🎯 College predictor for my rank
+                            </button>
+                            <button class="suggestion-btn w-full text-left p-3 rounded-lg glass-effect border border-white/10 hover:border-purple-500/50 transition-all duration-200 text-sm text-white">
+                                📍 Colleges in Mumbai and Pune
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="flex-1 flex flex-col h-screen pt-16 md:pt-0">
+            <!-- Chat Container -->
+            <div id="chat-container" class="flex-1 overflow-y-auto scrollbar-custom p-4 md:p-6 space-y-6" role="log" aria-live="polite" aria-label="Chat messages">
+                <!-- Welcome Message -->
+                <div class="flex items-start space-x-4 animate-fade-in">
+                    <div class="w-10 h-10 rounded-full avatar-bot flex items-center justify-center flex-shrink-0 shadow-lg">
+                        <span class="text-white font-bold">C</span>
+                    </div>
+                    <div class="flex-1 max-w-4xl">
+                        <div class="chat-bubble-bot rounded-2xl p-4 text-white shadow-lg">
+                            <div class="flex items-center mb-3">
+                                <span class="font-semibold">CET-Mentor</span>
+                                <span class="ml-2 text-xs bg-cyan-500 text-black px-2 py-0.5 rounded-full">AI Assistant</span>
+                            </div>
+                            <p class="mb-3">🎯 Welcome to <strong>CET-Mentor v2.0</strong>! I'm here to help you navigate MHT-CET admissions with data-driven insights.</p>
+                            <p class="text-gray-200 mb-2">I can help you with:</p>
+                            <ul class="text-gray-200 space-y-1 text-sm">
+                                <li>• Personalized college predictions based on your rank</li>
+                                <li>• Historical cutoff trends and admission statistics</li>
+                                <li>• Branch and college detailed comparisons</li>
+                                <li>• Step-by-step admission process guidance</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Suggestions Bar (Desktop) -->
+            <div id="quick-suggestions" class="hidden md:block px-6 py-3">
+                <div class="flex flex-wrap gap-2 justify-center max-w-4xl mx-auto">
+                    <button class="suggestion-btn px-4 py-2 glass-effect border border-white/20 rounded-full text-sm text-white hover:bg-white/10 transition-all duration-200">
+                        What's the cutoff for VJTI Computer Engineering?
+                    </button>
+                    <button class="suggestion-btn px-4 py-2 glass-effect border border-white/20 rounded-full text-sm text-white hover:bg-white/10 transition-all duration-200">
+                        Best colleges for 15000 CET rank?
+                    </button>
+                    <button class="suggestion-btn px-4 py-2 glass-effect border border-white/20 rounded-full text-sm text-white hover:bg-white/10 transition-all duration-200">
+                        Government vs Private college comparison
+                    </button>
+                </div>
+            </div>
+
+            <!-- Input Area -->
+            <div class="border-t border-white/10 p-4 md:p-6 glass-effect relative z-10">
+                <div class="max-w-4xl mx-auto">
+                    <div class="flex items-end space-x-3">
+                        <div class="flex-1 relative">
+                            <textarea
+                                id="message-input"
+                                rows="1"
+                                placeholder="Ask me about colleges, cutoffs, or admission guidance..."
+                                class="w-full bg-black/30 border border-white/20 rounded-2xl px-4 py-3 pr-12 resize-none text-white placeholder-gray-400 focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all scrollbar-custom"
+                                style="max-height: 120px"
+                            ></textarea>
+                            <button
+                                id="send-btn"
+                                class="absolute right-3 bottom-3 w-8 h-8 primary-gradient rounded-full flex items-center justify-center hover:shadow-lg transition-all duration-200 transform hover:scale-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                                disabled
+                            >
+                                <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-2 text-center">
+                        CET-Mentor can make mistakes. Consider verifying important information from official sources.
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Mobile Overlay -->
+    <div id="mobile-overlay" class="md:hidden fixed inset-0 bg-black/50 z-40 opacity-0 pointer-events-none transition-opacity duration-300"></div>
+
+    <script>
+        class CETMentor {
+            constructor() {
+                this.elements = {
+                    chatContainer: document.getElementById('chat-container'),
+                    messageInput: document.getElementById('message-input'),
+                    sendBtn: document.getElementById('send-btn'),
+                    sidebar: document.getElementById('sidebar'),
+                    mobileOverlay: document.getElementById('mobile-overlay'),
+                    mobileFilters: document.getElementById('mobile-filters'),
+                    quickSuggestions: document.getElementById('quick-suggestions')
+                };
+                
+                this.state = {
+                    conversationHistory: this.loadConversationHistory(),
+                    isWaitingForResponse: false,
+                    currentStreamingMessage: null
+                };
+                
+                this.init();
+            }
+
+            init() {
+                this.setupEventListeners();
+                this.autoResizeTextarea();
+                this.restoreChatHistory();
+                this.updateSendButton();
+                this.syncFilters();
+            }
+
+            setupEventListeners() {
+                // Mobile sidebar
+                document.getElementById('mobile-sidebar-toggle').addEventListener('click', () => this.toggleMobileSidebar());
+                document.getElementById('mobile-filters-toggle').addEventListener('click', () => this.toggleMobileFilters());
+                this.elements.mobileOverlay.addEventListener('click', () => this.closeMobileSidebar());
+
+                // Message sending
+                this.elements.sendBtn.addEventListener('click', () => this.sendMessage());
+                this.elements.messageInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        this.sendMessage();
+                    }
+                    if (e.key === 'Escape') {
+                        this.closeMobileSidebar();
+                    }
+                });
+                this.elements.messageInput.addEventListener('input', () => {
+                    this.autoResizeTextarea();
+                    this.updateSendButton();
+                });
+
+                // Quick suggestions
+                document.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('suggestion-btn')) {
+                        const text = e.target.textContent.replace(/[^\w\s\?\-\.]/g, '').trim();
+                        this.sendMessage(text);
+                    }
+                });
+
+                // Quick rank suggestion
+                document.getElementById('suggest-btn').addEventListener('click', () => {
+                    const rank = document.getElementById('rank-input').value.trim();
+                    if (rank) {
+                        this.sendMessage(`What are the best college options for CET rank ${rank}?`);
+                        document.getElementById('rank-input').value = '';
+                    }
+                });
+
+                // Keyboard shortcuts
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape' && this.elements.sidebar.classList.contains('open')) {
+                        this.closeMobileSidebar();
+                    }
+                });
+            }
+
+            syncFilters() {
+                const filterPairs = [
+                    ['category', 'mobile-category'],
+                    ['branch', 'mobile-branch'],
+                    ['city', 'mobile-city']
+                ];
+
+                filterPairs.forEach(([desktop, mobile]) => {
+                    const desktopEl = document.getElementById(desktop);
+                    const mobileEl = document.getElementById(mobile);
+
+                    desktopEl.addEventListener('change', () => {
+                        mobileEl.value = desktopEl.value;
+                    });
+
+                    mobileEl.addEventListener('change', () => {
+                        desktopEl.value = mobileEl.value;
+                    });
+                });
+            }
+
+            toggleMobileSidebar() {
+                this.elements.sidebar.classList.toggle('open');
+                if (this.elements.sidebar.classList.contains('open')) {
+                    this.elements.mobileOverlay.classList.add('opacity-100');
+                    this.elements.mobileOverlay.classList.remove('pointer-events-none');
+                } else {
+                    this.closeMobileSidebar();
+                }
+            }
+
+            toggleMobileFilters() {
+                this.elements.mobileFilters.classList.toggle('open');
+            }
+
+            closeMobileSidebar() {
+                this.elements.sidebar.classList.remove('open');
+                this.elements.mobileOverlay.classList.remove('opacity-100');
+                this.elements.mobileOverlay.classList.add('pointer-events-none');
+            }
+
+            updateSendButton() {
+                const hasText = this.elements.messageInput.value.trim().length > 0;
+                this.elements.sendBtn.disabled = !hasText || this.state.isWaitingForResponse;
+            }
+
+            autoResizeTextarea() {
+                this.elements.messageInput.style.height = 'auto';
+                this.elements.messageInput.style.height = Math.min(this.elements.messageInput.scrollHeight, 120) + 'px';
+            }
+
+            async sendMessage(messageText = null) {
+                if (this.state.isWaitingForResponse) return;
+
+                const message = messageText || this.elements.messageInput.value.trim();
+                if (!message) return;
+
+                // Clear input and hide suggestions
+                this.elements.messageInput.value = '';
+                this.autoResizeTextarea();
+                this.updateSendButton();
+                this.hideQuickSuggestions();
+
+                // Add user message
+                this.addUserMessage(message);
+                
+                // Add to conversation history
+                this.state.conversationHistory.push({
+                    role: 'user',
+                    content: message,
+                    timestamp: new Date().toISOString()
+                });
+                this.saveConversationHistory();
+
+                // Show typing indicator and start streaming
+                const typingIndicator = this.addTypingIndicator();
+                this.state.isWaitingForResponse = true;
+                this.updateSendButton();
+
+                try {
+                    await this.streamResponse(message, typingIndicator);
+                } catch (error) {
+                    console.error('Error sending message:', error);
+                    this.removeTypingIndicator(typingIndicator);
+                    this.addBotMessage('Sorry, I encountered an error. Please try again.', true);
+                } finally {
+                    this.state.isWaitingForResponse = false;
+                    this.updateSendButton();
+                    this.
