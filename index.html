@@ -649,4 +649,389 @@
                 } finally {
                     this.state.isWaitingForResponse = false;
                     this.updateSendButton();
-                    this.
+                    this.showQuickSuggestions();
+                }
+            }
+
+            async streamResponse(message, typingIndicator) {
+                const filters = this.getFilters();
+                
+                const payload = {
+                    message: message,
+                    history: this.state.conversationHistory.slice(-10),
+                    filters: filters
+                };
+
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'text/event-stream',
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                // Remove typing indicator and create bot message container
+                this.removeTypingIndicator(typingIndicator);
+                const messageContainer = this.createBotMessageContainer();
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let accumulatedContent = '';
+                let isVerifiedContext = false;
+
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+
+                        const chunk = decoder.decode(value);
+                        const lines = chunk.split('\n');
+
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const data = line.slice(6).trim();
+                                if (data === '[DONE]') {
+                                    this.finalizeStreamingMessage(messageContainer, accumulatedContent, isVerifiedContext);
+                                    return;
+                                }
+
+                                try {
+                                    const parsed = JSON.parse(data);
+                                    if (parsed.content) {
+                                        accumulatedContent += parsed.content;
+                                        this.updateStreamingMessage(messageContainer, accumulatedContent);
+                                    }
+                                    if (parsed.verified_context) {
+                                        isVerifiedContext = true;
+                                    }
+                                } catch (e) {
+                                    // Handle non-JSON streaming data
+                                    if (data.includes('VERIFIED_CONTEXT')) {
+                                        isVerifiedContext = true;
+                                    } else if (data.trim() && data !== '[DONE]') {
+                                        accumulatedContent += data;
+                                        this.updateStreamingMessage(messageContainer, accumulatedContent);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    reader.releaseLock();
+                    if (accumulatedContent) {
+                        this.finalizeStreamingMessage(messageContainer, accumulatedContent, isVerifiedContext);
+                    }
+                }
+            }
+
+            getFilters() {
+                return {
+                    category: document.getElementById('category').value,
+                    branch: document.getElementById('branch').value,
+                    city: document.getElementById('city').value
+                };
+            }
+
+            addUserMessage(message) {
+                const messageEl = document.createElement('div');
+                messageEl.className = 'flex items-start space-x-4 justify-end animate-fade-in';
+                
+                messageEl.innerHTML = `
+                    <div class="flex-1 max-w-4xl flex justify-end">
+                        <div class="chat-bubble-user rounded-2xl p-4 text-white shadow-lg max-w-lg">
+                            ${this.escapeHtml(message)}
+                        </div>
+                    </div>
+                    <div class="w-10 h-10 rounded-full avatar-user flex items-center justify-center flex-shrink-0 shadow-lg">
+                        <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+                        </svg>
+                    </div>
+                `;
+                
+                this.elements.chatContainer.appendChild(messageEl);
+                this.scrollToBottom();
+            }
+
+            addTypingIndicator() {
+                const typingEl = document.createElement('div');
+                typingEl.className = 'flex items-start space-x-4 animate-fade-in typing-indicator-container';
+                
+                typingEl.innerHTML = `
+                    <div class="w-10 h-10 rounded-full avatar-bot flex items-center justify-center flex-shrink-0 shadow-lg">
+                        <span class="text-white font-bold">C</span>
+                    </div>
+                    <div class="flex-1 max-w-4xl">
+                        <div class="chat-bubble-bot rounded-2xl p-4 text-white shadow-lg">
+                            <div class="flex items-center mb-2">
+                                <span class="font-semibold">CET-Mentor</span>
+                            </div>
+                            <div class="typing-dots">
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                this.elements.chatContainer.appendChild(typingEl);
+                this.scrollToBottom();
+                return typingEl;
+            }
+
+            removeTypingIndicator(typingEl) {
+                if (typingEl && typingEl.parentNode) {
+                    typingEl.parentNode.removeChild(typingEl);
+                }
+            }
+
+            createBotMessageContainer() {
+                const messageEl = document.createElement('div');
+                messageEl.className = 'flex items-start space-x-4 animate-fade-in';
+                
+                messageEl.innerHTML = `
+                    <div class="w-10 h-10 rounded-full avatar-bot flex items-center justify-center flex-shrink-0 shadow-lg">
+                        <span class="text-white font-bold">C</span>
+                    </div>
+                    <div class="flex-1 max-w-4xl">
+                        <div class="chat-bubble-bot rounded-2xl p-4 text-white shadow-lg">
+                            <div class="flex items-center mb-3">
+                                <span class="font-semibold">CET-Mentor</span>
+                                <span class="ml-2 text-xs bg-cyan-500 text-black px-2 py-0.5 rounded-full verified-badge" style="display: none;">Verified Data</span>
+                            </div>
+                            <div class="message-content"></div>
+                            <div class="feedback-buttons flex items-center space-x-3 mt-3 opacity-0 transition-opacity duration-300">
+                                <button class="feedback-btn text-gray-400 hover:text-green-400 transition-all duration-200" data-feedback="positive" aria-label="Thumbs up">
+                                    <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z"/>
+                                    </svg>
+                                </button>
+                                <button class="feedback-btn text-gray-400 hover:text-red-400 transition-all duration-200" data-feedback="negative" aria-label="Thumbs down">
+                                    <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.58-6.59c.37-.36.59-.86.59-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                this.elements.chatContainer.appendChild(messageEl);
+                this.scrollToBottom();
+                
+                // Add feedback event listeners
+                const feedbackButtons = messageEl.querySelectorAll('.feedback-btn');
+                feedbackButtons.forEach(btn => {
+                    btn.addEventListener('click', () => this.handleFeedback(btn, messageEl));
+                });
+
+                // Show feedback buttons on hover
+                const messageContainer = messageEl.querySelector('.chat-bubble-bot');
+                messageContainer.addEventListener('mouseenter', () => {
+                    messageEl.querySelector('.feedback-buttons').style.opacity = '1';
+                });
+                messageContainer.addEventListener('mouseleave', () => {
+                    messageEl.querySelector('.feedback-buttons').style.opacity = '0';
+                });
+                
+                return messageEl;
+            }
+
+            updateStreamingMessage(container, content) {
+                const messageContent = container.querySelector('.message-content');
+                messageContent.innerHTML = this.formatMessage(content);
+                this.scrollToBottom();
+            }
+
+            finalizeStreamingMessage(container, content, isVerified) {
+                const messageContent = container.querySelector('.message-content');
+                messageContent.innerHTML = this.formatMessage(content);
+                
+                if (isVerified) {
+                    const verifiedBadge = container.querySelector('.verified-badge');
+                    if (verifiedBadge) {
+                        verifiedBadge.style.display = 'inline-block';
+                    }
+                    container.querySelector('.chat-bubble-bot').classList.add('verified-context');
+                }
+
+                // Add to conversation history
+                this.state.conversationHistory.push({
+                    role: 'assistant',
+                    content: content,
+                    verified: isVerified,
+                    timestamp: new Date().toISOString()
+                });
+                this.saveConversationHistory();
+                
+                this.scrollToBottom();
+            }
+
+            addBotMessage(content, isError = false) {
+                const container = this.createBotMessageContainer();
+                const messageContent = container.querySelector('.message-content');
+                
+                if (isError) {
+                    messageContent.innerHTML = `<div class="text-red-300">${this.escapeHtml(content)}</div>`;
+                } else {
+                    messageContent.innerHTML = this.formatMessage(content);
+                }
+                
+                this.scrollToBottom();
+            }
+
+            formatMessage(content) {
+                // Basic message formatting
+                let formatted = this.escapeHtml(content);
+                
+                // Convert markdown-style formatting
+                formatted = formatted
+                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                    .replace(/`(.*?)`/g, '<code class="bg-black/30 px-1 rounded">$1</code>')
+                    .replace(/\n/g, '<br>');
+                
+                // Format lists
+                formatted = formatted.replace(/^[\s]*[-•]\s+(.+)$/gm, '<li class="ml-4">• $1</li>');
+                
+                return formatted;
+            }
+
+            async handleFeedback(button, messageContainer) {
+                const feedback = button.dataset.feedback;
+                const messageContent = messageContainer.querySelector('.message-content').textContent;
+                
+                try {
+                    await fetch('/feedback', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            message: messageContent,
+                            feedback: feedback,
+                            timestamp: new Date().toISOString()
+                        })
+                    });
+                    
+                    // Visual feedback
+                    button.style.transform = 'scale(1.2)';
+                    setTimeout(() => {
+                        button.style.transform = 'scale(1)';
+                    }, 200);
+                    
+                } catch (error) {
+                    console.error('Failed to send feedback:', error);
+                }
+            }
+
+            hideQuickSuggestions() {
+                if (this.elements.quickSuggestions) {
+                    this.elements.quickSuggestions.style.display = 'none';
+                }
+            }
+
+            showQuickSuggestions() {
+                if (this.elements.quickSuggestions && this.state.conversationHistory.length <= 2) {
+                    this.elements.quickSuggestions.style.display = 'block';
+                }
+            }
+
+            scrollToBottom() {
+                requestAnimationFrame(() => {
+                    this.elements.chatContainer.scrollTop = this.elements.chatContainer.scrollHeight;
+                });
+            }
+
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            loadConversationHistory() {
+                try {
+                    const stored = sessionStorage.getItem('cet-mentor-history');
+                    return stored ? JSON.parse(stored) : [];
+                } catch {
+                    return [];
+                }
+            }
+
+            saveConversationHistory() {
+                try {
+                    sessionStorage.setItem('cet-mentor-history', JSON.stringify(this.state.conversationHistory));
+                } catch (error) {
+                    console.error('Failed to save conversation history:', error);
+                }
+            }
+
+            restoreChatHistory() {
+                if (this.state.conversationHistory.length === 0) return;
+
+                // Clear welcome message for restored chats
+                this.elements.chatContainer.innerHTML = '';
+                
+                this.state.conversationHistory.forEach(msg => {
+                    if (msg.role === 'user') {
+                        this.addUserMessage(msg.content);
+                    } else if (msg.role === 'assistant') {
+                        const container = this.createBotMessageContainer();
+                        const messageContent = container.querySelector('.message-content');
+                        messageContent.innerHTML = this.formatMessage(msg.content);
+                        
+                        if (msg.verified) {
+                            const verifiedBadge = container.querySelector('.verified-badge');
+                            if (verifiedBadge) {
+                                verifiedBadge.style.display = 'inline-block';
+                            }
+                            container.querySelector('.chat-bubble-bot').classList.add('verified-context');
+                        }
+                    }
+                });
+                
+                this.scrollToBottom();
+                this.hideQuickSuggestions();
+            }
+        }
+
+        // Initialize the application
+        document.addEventListener('DOMContentLoaded', () => {
+            window.cetMentor = new CETMentor();
+        });
+
+        // Add some enhanced interactivity
+        document.addEventListener('mousemove', (e) => {
+            // Subtle cursor-following gradient effect
+            const cursor = document.querySelector('.cursor-gradient');
+            if (cursor) {
+                cursor.style.left = e.clientX + 'px';
+                cursor.style.top = e.clientY + 'px';
+            }
+        });
+
+        // Add performance optimizations
+        let resizeTimeout;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(() => {
+                if (window.cetMentor) {
+                    window.cetMentor.scrollToBottom();
+                }
+            }, 100);
+        });
+
+        // Service worker registration for PWA capabilities (optional)
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                // Can be enabled if you create a service worker
+                // navigator.serviceWorker.register('/sw.js');
+            });
+        }
+    </script>
+</body>
+</html>
