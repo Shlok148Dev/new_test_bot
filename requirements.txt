@@ -1,0 +1,28 @@
+# Web framework
+flask==3.0.3
+
+# For async scraping
+aiohttp==3.9.5
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+# For vector store
+faiss-cpu==1.8.0
+
+# For data handling
+pandas==2.2.2
+numpy==1.26.4
+
+# For LLM API calls
+openai==1.40.0
+httpx==0.27.0
+requests==2.32.3
+
+# For environment variables
+python-dotenv==1.0.1
+
+# For JSON schema validation (optional, helps with structured outputs)
+jsonschema==4.23.0
+
+# For interactive debugging (optional)
+ipython==8.26.0
