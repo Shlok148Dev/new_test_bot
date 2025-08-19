@@ -64,6 +64,12 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import requests
 from dotenv import load_dotenv
+import os
+load_dotenv()
+
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "default_secret")
+
 
 # Import vector store with fallback
 try:
@@ -99,7 +105,7 @@ except ImportError:
             pass
 
 # Load environment variables
-load_dotenv()
+
 
 # Configure comprehensive logging
 def setup_logging():
